@@ -1,0 +1,75 @@
+{
+  "name": "xao-ethdenver-nft",
+  "version": "1.0.0",
+  "description": "XAO ETHDenver NFT Collection - Free, culturally expressive NFTs on Base",
+  "main": "contracts/XAOETHDenverNFT_ERC721A.sol",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "test:gas": "REPORT_GAS=true hardhat test",
+    "test:grep": "hardhat test --grep",
+    "deploy:sepolia": "hardhat run scripts/deploy.js --network baseSepolia",
+    "deploy:base": "hardhat run scripts/deploy.js --network base",
+    "mint:set-window": "hardhat run scripts/setMintWindow.js --network base",
+    "mint:set-window:sepolia": "hardhat run scripts/setMintWindow.js --network baseSepolia",
+    "mint:test": "hardhat run scripts/testMint.js --network base",
+    "status": "hardhat run scripts/status.js --network base",
+    "status:sepolia": "hardhat run scripts/status.js --network baseSepolia",
+    "mint:close": "hardhat run scripts/closeMint.js --network base",
+    "metadata:freeze": "hardhat run scripts/freezeMetadata.js --network base",
+    "verify": "hardhat verify --network base",
+    "clean": "hardhat clean",
+    "help": "hardhat help"
+  },
+  "keywords": [
+    "nft",
+    "ethereum",
+    "base",
+    "erc721",
+    "erc721a",
+    "smart-contract",
+    "solidity",
+    "ethdenver",
+    "xao"
+  ],
+  "author": "XAO Team",
+  "license": "MIT",
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "@nomicfoundation/hardhat-chai-matchers": "^2.0.0",
+    "@nomicfoundation/hardhat-ethers": "^3.0.0",
+    "@nomicfoundation/hardhat-verify": "^2.0.0",
+    "@nomicfoundation/hardhat-network-helpers": "^1.0.0",
+    "@nomiclabs/hardhat-etherscan": "^3.1.7",
+    "@openzeppelin/hardhat-upgrades": "^2.1.1",
+    "@typechain/ethers-v6": "^11.1.0",
+    "@typechain/hardhat": "^9.1.0",
+    "@types/chai": "^4.3.11",
+    "@types/mocha": "^10.0.6",
+    "chai": "^4.3.10",
+    "dotenv": "^16.3.1",
+    "ethers": "^6.10.0",
+    "hardhat": "^2.19.4",
+    "hardhat-gas-reporter": "^1.0.9",
+    "solidity-coverage": "^0.8.5",
+    "ts-node": "^10.9.2",
+    "typechain": "^8.3.2",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.0.0",
+    "erc721a": "^4.2.3"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=9.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-username/xao-ethdenver-nft.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-username/xao-ethdenver-nft/issues"
+  },
+  "homepage": "https://github.com/your-username/xao-ethdenver-nft#readme"
+}

@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+interface IERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
 contract EventContract {
     enum ContractStatus { Draft, Pending, Signed, Cancelled, Completed }
     
@@ -40,6 +46,11 @@ contract EventContract {
     uint256 public totalIssued;
     uint256 public revenue;
     mapping(address => uint256) public refunds;
+
+    // ERC20 payments: token → typeId → price (0 = not accepted)
+    mapping(address => mapping(uint256 => uint256)) public tokenPrices;
+    // Accumulated ERC20 revenue per token
+    mapping(address => uint256) public tokenRevenue;
     
     event TicketTypeAdded(string name, uint256 count, bool free, uint256 price);
     event TicketPurchased(address indexed buyer, uint256 indexed typeId, uint256 qty, uint256 total);
@@ -50,9 +61,12 @@ contract EventContract {
     event RefundIssued(address indexed user, uint256 amt);
     event ContractSigned(address indexed signer);
     event Cancelled(address indexed by);
+    event TokenPriceSet(uint256 indexed typeId, address indexed token, uint256 price);
+    event TicketPurchasedWithToken(address indexed buyer, uint256 indexed typeId, uint256 qty, address indexed token, uint256 total);
+    event TokenWithdrawn(address indexed token, address indexed to, uint256 amount);
     
-    modifier onlyParty() { require(msg.sender == party1.addr || msg.sender == party2.addr); _; }
-    modifier onlyOrg() { require(msg.sender == party1.addr || msg.sender == party2.addr); _; }
+    modifier onlyParty() { require(msg.sender == party1.addr || msg.sender == party2.addr, "Not a party"); _; }
+    modifier onlyOrg() { require(msg.sender == party1.addr, "Not organizer"); _; }
     modifier inDraft() { require(status == ContractStatus.Draft); _; }
     modifier signed() { require(status == ContractStatus.Signed); _; }
     
@@ -99,7 +113,7 @@ contract EventContract {
         }
         
         _issueTickets(msg.sender, _typeId, _qty);
-        emit TicketPurchased(msg.sender, _typeId, _qty, msg.value);
+        emit TicketPurchased(msg.sender, _typeId, _qty, _qty * t.price);
     }
     
     function grantFreeTickets(address[] calldata _recipients, uint256 _typeId, uint256 _qty) external onlyOrg signed {
@@ -113,7 +127,6 @@ contract EventContract {
             require(_recipients[i] != address(0));
             _issueTickets(_recipients[i], _typeId, _qty);
         }
-        sold[_typeId] += total;
         emit TicketsGranted(msg.sender, _recipients.length, _typeId, total);
     }
     
@@ -136,6 +149,7 @@ contract EventContract {
             emit TicketIssued(id, _owner, _typeId);
         }
         userTickets[_owner][_typeId] += _qty;
+        sold[_typeId] += _qty;
         totalIssued += _qty;
     }
     
@@ -198,6 +212,58 @@ contract EventContract {
         party2.name = _name;
     }
     
+    // -------------------------------------------------------
+    // ERC20 payment functions
+    // -------------------------------------------------------
+
+    /// @notice Organizer sets the token price for a ticket type.
+    ///         Set _price to 0 to disable that token for the type.
+    function setTokenPrice(uint256 _typeId, address _token, uint256 _price) external onlyOrg {
+        require(_typeId < tickets.length, "Invalid typeId");
+        require(_token != address(0), "Zero token address");
+        tokenPrices[_token][_typeId] = _price;
+        emit TokenPriceSet(_typeId, _token, _price);
+    }
+
+    /// @notice Buy tickets by paying with an accepted ERC20 token.
+    ///         Caller must have pre-approved this contract for at least _qty * tokenPrice.
+    function buyTicketsWithToken(uint256 _typeId, uint256 _qty, address _token) external signed {
+        require(config.enabled && _typeId < tickets.length && _qty > 0, "Invalid params");
+        require(_token != address(0), "Zero token address");
+        TicketType memory t = tickets[_typeId];
+        require(!t.free, "Free tickets need no payment");
+        require(block.timestamp >= t.saleDate, "Sale not started");
+        require(sold[_typeId] + _qty <= t.count, "Type sold out");
+        require(totalIssued + _qty <= config.capacity, "Capacity reached");
+
+        uint256 price = tokenPrices[_token][_typeId];
+        require(price > 0, "Token not accepted for this type");
+
+        uint256 total = _qty * price;
+        require(IERC20(_token).transferFrom(msg.sender, address(this), total), "Token transfer failed");
+        tokenRevenue[_token] += total;
+
+        _issueTickets(msg.sender, _typeId, _qty);
+        emit TicketPurchasedWithToken(msg.sender, _typeId, _qty, _token, total);
+    }
+
+    /// @notice Organizer withdraws all accumulated revenue for a given ERC20 token.
+    function withdrawToken(address _token, address _to) external onlyOrg {
+        require(_token != address(0) && _to != address(0), "Zero address");
+        uint256 amount = tokenRevenue[_token];
+        require(amount > 0, "No token revenue");
+        tokenRevenue[_token] = 0;
+        require(IERC20(_token).transfer(_to, amount), "Token transfer failed");
+        emit TokenWithdrawn(_token, _to, amount);
+    }
+
+    /// @notice Returns the ERC20 price for a given token and ticket type (0 = not accepted).
+    function getTokenPrice(address _token, uint256 _typeId) external view returns (uint256) {
+        return tokenPrices[_token][_typeId];
+    }
+
+    // -------------------------------------------------------
+
     function getTickets(address _user) external view returns (uint256[] memory) {
         uint256[] memory r = new uint256[](totalIssued);
         uint256 c = 0;

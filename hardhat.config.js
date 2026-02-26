@@ -24,6 +24,9 @@ module.exports = {
     },
   },
   networks: {
+    hardhat: {
+      allowUnlimitedContractSize: true,
+    },
     base: {
       url: BASE_RPC,
       accounts: [PRIVATE_KEY],

@@ -19,7 +19,13 @@
     "metadata:freeze": "hardhat run scripts/freezeMetadata.js --network base",
     "verify": "hardhat verify --network base",
     "clean": "hardhat clean",
-    "help": "hardhat help"
+    "help": "hardhat help",
+    "show:factory:sepolia": "hardhat run scripts/deployShowContractFactory.js --network baseSepolia",
+    "show:factory:base": "hardhat run scripts/deployShowContractFactory.js --network base",
+    "show:create:sepolia": "hardhat run scripts/createShowContract.js --network baseSepolia",
+    "show:create:base": "hardhat run scripts/createShowContract.js --network base",
+    "show:verify:sepolia": "hardhat run scripts/verifyShowContracts.js --network baseSepolia",
+    "show:verify:base": "hardhat run scripts/verifyShowContracts.js --network base"
   },
   "keywords": [
     "nft",

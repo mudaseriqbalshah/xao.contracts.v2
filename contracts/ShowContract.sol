@@ -4,7 +4,6 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
-import "./XAOTicket.sol";
 
 interface IShowUSDC {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
@@ -12,11 +11,59 @@ interface IShowUSDC {
     function balanceOf(address account) external view returns (uint256);
 }
 
+/// @dev XAOTicket is deployed via an external factory so its (large) creation
+///      bytecode is NOT embedded in ShowContract. These interfaces are all
+///      ShowContract needs to talk to the factory and the resulting tickets.
+interface IXAOTicketFactory {
+    function deploy(
+        address show,
+        address usdc,
+        address treasury,
+        string calldata eventName,
+        uint256 capacity
+    ) external returns (address);
+}
+
+interface IXAOTicketAdmin {
+    function ADMIN_ROLE() external view returns (bytes32);
+    function grantRole(bytes32 role, address account) external;
+}
+
 /// @title ShowContract — XAO Show Agreement + Escrow (Phase 1 MVP)
 /// @notice Replaces EventContract. Governs show agreements between promoters,
 ///         artists, venues, and booking agents. Manages payment schedules,
 ///         escrow, cancellation refunds, dispute gating, and XAOTicket deployment.
 contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
+
+    // ── Custom errors (replaced require-strings to cut bytecode size) ──
+    error NotAParty();
+    error NotParty1();
+    error AlreadyFinalized();
+    error TerminalState();
+    error EscrowFrozen();
+    error ZeroPartyAddress();
+    error ZeroProtocolAddress();
+    error ZeroTicketFactory();
+    error GuaranteeUseFlatOrPctNotBoth();
+    error AlreadySigned();
+    error TerminalOrDisputedState();
+    error EditFeeFailed();
+    error NotFinalized();
+    error InvalidStateForDispute();
+    error NotDisputed();
+    error AlreadyVoted();
+    error PartiesDisagreeOnResolution();
+    error TransferFailed();
+    error ZeroAmount();
+    error NotTicketContract();
+    error NotCompleted();
+    error ZeroAddress();
+    error InvalidAmount();
+    error MustBeAPPROVEDOrACTIVE();
+    error ShowNotEndedYet();
+    error ResaleSplitsMustSumTo10000();
+    error NotParty2();
+
 
     // ─── ROLES ────────────────────────────────────────────────────────────
     bytes32 public constant ADMIN_ROLE    = keccak256("ADMIN_ROLE");
@@ -144,12 +191,12 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
     uint256 public merchSplitBPS;
 
     // ─── PAYMENT SCHEDULES ────────────────────────────────────────────────
-    PaymentSchedule[]   public party1Deposits;
-    CancellationRefund[] public party1CancellationRefunds;
-    PaymentSchedule[]   public party2Deposits;
-    CancellationRefund[] public party2CancellationRefunds;
-    PaymentSchedule[]   public party1Payouts;
-    PaymentSchedule[]   public party2Payouts;
+    PaymentSchedule[]   internal party1Deposits;
+    CancellationRefund[] internal party1CancellationRefunds;
+    PaymentSchedule[]   internal party2Deposits;
+    CancellationRefund[] internal party2CancellationRefunds;
+    PaymentSchedule[]   internal party1Payouts;
+    PaymentSchedule[]   internal party2Payouts;
 
     // ─── PROMOTION ────────────────────────────────────────────────────────
     string  public eventName;
@@ -164,6 +211,18 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
     // ─── CONTRACT INTEGRITY ───────────────────────────────────────────────
     bytes32 public contractCIDHash;   // sha256(IPFS CID of signed contract JSON)
 
+    // ─── FRONTEND-PARITY FIELDS ───────────────────────────────────────────
+    // Collected by the create-contract UI but previously had no on-chain home.
+    // Populated post-deploy while still Draft via the setters below
+    // (onlyParty1, notFinalized), same pattern as the payment schedules.
+    string[] public genres;            // event genres (promotion.genres)
+    uint256  public compTickets;       // complimentary ticket count (tickets.comps)
+    uint256  public ticketsSaleDate;   // when tickets go on sale, unix (datesAndTimes.ticketsSale)
+    // Default resale royalty split (BPS, must sum to 10000) — mirrors XAOTicket per-tier splits.
+    uint256  public resaleParty1BPS;
+    uint256  public resaleParty2BPS;
+    uint256  public resaleResellerBPS;
+
     // ─── SIGNING & STATUS ─────────────────────────────────────────────────
     mapping(address => bool) public hasSigned;
     bool   public isFinalized;
@@ -176,6 +235,7 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
     // ─── PROTOCOL REFERENCES ──────────────────────────────────────────────
     IShowUSDC public immutable usdc;
     address   public immutable treasury;
+    address   public immutable ticketFactory;   // deploys XAOTicket (see IXAOTicketFactory)
 
     // ─── DISPUTE STATE ────────────────────────────────────────────────────
     mapping(address => bool) public hasVotedResolve;
@@ -196,33 +256,27 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
 
     // ─── MODIFIERS ────────────────────────────────────────────────────────
     modifier onlyParty() {
-        require(
-            msg.sender == party1.wallet || msg.sender == party2.wallet,
-            "Not a party"
-        );
+        if (!(msg.sender == party1.wallet || msg.sender == party2.wallet)) revert NotAParty();
         _;
     }
 
     modifier onlyParty1() {
-        require(msg.sender == party1.wallet, "Not party1");
+        if (!(msg.sender == party1.wallet)) revert NotParty1();
         _;
     }
 
     modifier notFinalized() {
-        require(!isFinalized, "Already finalized");
+        if (!(!isFinalized)) revert AlreadyFinalized();
         _;
     }
 
     modifier notTerminal() {
-        require(
-            status != Status.CANCELLED && status != Status.COMPLETED,
-            "Terminal state"
-        );
+        if (!(status != Status.CANCELLED && status != Status.COMPLETED)) revert TerminalState();
         _;
     }
 
     modifier notDisputed() {
-        require(status != Status.DISPUTED, "Escrow frozen");
+        if (!(status != Status.DISPUTED)) revert EscrowFrozen();
         _;
     }
 
@@ -238,14 +292,13 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
         FinancialConfig memory _fin,
         PromoConfig    memory _promo,
         address               _usdc,
-        address               _treasury
+        address               _treasury,
+        address               _ticketFactory
     ) {
-        require(_p1.wallet != address(0) && _p2Wallet != address(0), "Zero party address");
-        require(_usdc != address(0) && _treasury != address(0), "Zero protocol address");
-        require(
-            !(_fin.guaranteeUSDC > 0 && _fin.guaranteePctBPS > 0),
-            "Guarantee: use flat or pct, not both"
-        );
+        if (!(_p1.wallet != address(0) && _p2Wallet != address(0))) revert ZeroPartyAddress();
+        if (!(_usdc != address(0) && _treasury != address(0))) revert ZeroProtocolAddress();
+        if (!(_ticketFactory != address(0))) revert ZeroTicketFactory();
+        if (!(!(_fin.guaranteeUSDC > 0 && _fin.guaranteePctBPS > 0))) revert GuaranteeUseFlatOrPctNotBoth();
 
         // Parties
         party1 = Party(_p1.wallet, _p1.role, _p1.xaoUsername);
@@ -290,8 +343,9 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
         contractCIDHash      = _promo.contractCIDHash;
 
         // Protocol
-        usdc     = IShowUSDC(_usdc);
-        treasury = _treasury;
+        usdc          = IShowUSDC(_usdc);
+        treasury      = _treasury;
+        ticketFactory = _ticketFactory;
 
         status = Status.DRAFT;
 
@@ -306,14 +360,11 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
     ///         party2 signs (PROPOSED or COUNTER_PROPOSED) → APPROVED.
     ///         On APPROVED: isFinalized = true, XAOTicket deployed if ticketsEnabled.
     function sign() external onlyParty whenNotPaused {
-        require(!hasSigned[msg.sender], "Already signed");
-        require(!isFinalized, "Already finalized");
-        require(
-            status != Status.CANCELLED &&
+        if (!(!hasSigned[msg.sender])) revert AlreadySigned();
+        if (!(!isFinalized)) revert AlreadyFinalized();
+        if (!(status != Status.CANCELLED &&
             status != Status.COMPLETED &&
-            status != Status.DISPUTED,
-            "Terminal or disputed state"
-        );
+            status != Status.DISPUTED)) revert TerminalOrDisputedState();
 
         hasSigned[msg.sender] = true;
 
@@ -337,17 +388,20 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
 
     /// @dev Deploy an XAOTicket for this show and grant party1 ADMIN_ROLE on it.
     function _deployTicketCollection() internal {
-        XAOTicket ticket = new XAOTicket(
+        // Deploy via the external factory so XAOTicket's creation bytecode is
+        // not embedded here. XAOTicket grants admin to `address(this)` (the
+        // show), not to the factory, so we can still grant party1 below.
+        address ticket = IXAOTicketFactory(ticketFactory).deploy(
             address(this),
             address(usdc),
             treasury,
             eventName,
             totalCapacity
         );
-        ticketCollection = address(ticket);
+        ticketCollection = ticket;
         // Grant party1 admin so they can add tiers and scanners
-        ticket.grantRole(ticket.ADMIN_ROLE(), party1.wallet);
-        emit TicketCollectionDeployed(address(ticket));
+        IXAOTicketAdmin(ticket).grantRole(IXAOTicketAdmin(ticket).ADMIN_ROLE(), party1.wallet);
+        emit TicketCollectionDeployed(ticket);
     }
 
     // ─── CID UPDATE (with edit fee) ───────────────────────────────────────
@@ -363,7 +417,7 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
         whenNotPaused
         nonReentrant
     {
-        require(usdc.transferFrom(msg.sender, treasury, CONTRACT_EDIT_FEE), "Edit fee failed");
+        if (!(usdc.transferFrom(msg.sender, treasury, CONTRACT_EDIT_FEE))) revert EditFeeFailed();
 
         if (status == Status.PROPOSED && msg.sender == party2.wallet) {
             hasSigned[party1.wallet] = false;
@@ -388,13 +442,10 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
 
     /// @notice Freeze escrow by raising a dispute. Only valid after finalization.
     function raiseDispute() external onlyParty whenNotPaused {
-        require(isFinalized, "Not finalized");
-        require(
-            status != Status.CANCELLED &&
+        if (!(isFinalized)) revert NotFinalized();
+        if (!(status != Status.CANCELLED &&
             status != Status.COMPLETED &&
-            status != Status.DISPUTED,
-            "Invalid state for dispute"
-        );
+            status != Status.DISPUTED)) revert InvalidStateForDispute();
         status = Status.DISPUTED;
         emit DisputeOpened(address(this), msg.sender);
     }
@@ -407,18 +458,15 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
         nonReentrant
         whenNotPaused
     {
-        require(status == Status.DISPUTED, "Not disputed");
-        require(!hasVotedResolve[msg.sender], "Already voted");
+        if (!(status == Status.DISPUTED)) revert NotDisputed();
+        if (!(!hasVotedResolve[msg.sender])) revert AlreadyVoted();
 
         hasVotedResolve[msg.sender] = true;
         resolveVote[msg.sender] = releaseToParty2;
 
         // Only execute when both parties have voted
         if (hasVotedResolve[party1.wallet] && hasVotedResolve[party2.wallet]) {
-            require(
-                resolveVote[party1.wallet] == resolveVote[party2.wallet],
-                "Parties disagree on resolution"
-            );
+            if (!(resolveVote[party1.wallet] == resolveVote[party2.wallet])) revert PartiesDisagreeOnResolution();
 
             bool toParty2 = resolveVote[party1.wallet];
             status = Status.COMPLETED;
@@ -427,7 +475,7 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
                 uint256 amount = escrowBalance;
                 escrowBalance = 0;
                 address recipient = toParty2 ? party2.wallet : party1.wallet;
-                require(usdc.transfer(recipient, amount), "Transfer failed");
+                if (!(usdc.transfer(recipient, amount))) revert TransferFailed();
                 emit EscrowWithdrawn(recipient, amount);
             }
             emit DisputeResolved(address(this), toParty2);
@@ -445,9 +493,9 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
         notDisputed
         whenNotPaused
     {
-        require(isFinalized, "Not finalized");
-        require(amount > 0, "Zero amount");
-        require(usdc.transferFrom(msg.sender, address(this), amount), "Transfer failed");
+        if (!(isFinalized)) revert NotFinalized();
+        if (!(amount > 0)) revert ZeroAmount();
+        if (!(usdc.transferFrom(msg.sender, address(this), amount))) revert TransferFailed();
         escrowBalance += amount;
         emit EscrowDeposited(msg.sender, amount);
     }
@@ -455,8 +503,8 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
     /// @notice Called by XAOTicket after routing net revenue to this contract.
     ///         XAOTicket transfers USDC directly then calls this to update the escrow counter.
     function creditRevenue(uint256 amount) external nonReentrant notDisputed {
-        require(msg.sender == ticketCollection, "Not ticket contract");
-        require(amount > 0, "Zero amount");
+        if (!(msg.sender == ticketCollection)) revert NotTicketContract();
+        if (!(amount > 0)) revert ZeroAmount();
         escrowBalance += amount;
         emit RevenueReceived(amount);
     }
@@ -468,21 +516,18 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
         nonReentrant
         whenNotPaused
     {
-        require(status == Status.COMPLETED, "Not completed");
-        require(to != address(0), "Zero address");
-        require(amount > 0 && amount <= escrowBalance, "Invalid amount");
+        if (!(status == Status.COMPLETED)) revert NotCompleted();
+        if (!(to != address(0))) revert ZeroAddress();
+        if (!(amount > 0 && amount <= escrowBalance)) revert InvalidAmount();
         escrowBalance -= amount;
-        require(usdc.transfer(to, amount), "Transfer failed");
+        if (!(usdc.transfer(to, amount))) revert TransferFailed();
         emit EscrowWithdrawn(to, amount);
     }
 
     /// @notice Party1 marks the show as COMPLETED (can only be called after endTime).
     function markCompleted() external onlyParty1 notDisputed whenNotPaused {
-        require(
-            status == Status.APPROVED || status == Status.ACTIVE,
-            "Must be APPROVED or ACTIVE"
-        );
-        require(block.timestamp >= endTime, "Show not ended yet");
+        if (!(status == Status.APPROVED || status == Status.ACTIVE)) revert MustBeAPPROVEDOrACTIVE();
+        if (!(block.timestamp >= endTime)) revert ShowNotEndedYet();
         status = Status.COMPLETED;
         emit StatusChanged(Status.COMPLETED);
     }
@@ -533,11 +578,44 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
     function getParty2Payouts()              external view returns (PaymentSchedule[]   memory) { return party2Payouts; }
     function getParty1CancellationRefunds()  external view returns (CancellationRefund[] memory) { return party1CancellationRefunds; }
     function getParty2CancellationRefunds()  external view returns (CancellationRefund[] memory) { return party2CancellationRefunds; }
+    function getGenres()                      external view returns (string[]            memory) { return genres; }
+
+    // ─── FRONTEND-PARITY SETTERS (Draft-only, party1) ─────────────────────
+
+    /// @notice Set the event genres, replacing any existing list.
+    function setGenres(string[] calldata _genres) external onlyParty1 notFinalized {
+        delete genres;
+        for (uint256 i = 0; i < _genres.length; i++) {
+            genres.push(_genres[i]);
+        }
+    }
+
+    /// @notice Set the complimentary-ticket count.
+    function setCompTickets(uint256 _compTickets) external onlyParty1 notFinalized {
+        compTickets = _compTickets;
+    }
+
+    /// @notice Set the ticket on-sale date (unix seconds).
+    function setTicketsSaleDate(uint256 _ticketsSaleDate) external onlyParty1 notFinalized {
+        ticketsSaleDate = _ticketsSaleDate;
+    }
+
+    /// @notice Set the default resale royalty split. BPS must sum to 10000.
+    function setResaleSplits(uint256 _party1BPS, uint256 _party2BPS, uint256 _resellerBPS)
+        external
+        onlyParty1
+        notFinalized
+    {
+        if (!(_party1BPS + _party2BPS + _resellerBPS == 10_000)) revert ResaleSplitsMustSumTo10000();
+        resaleParty1BPS   = _party1BPS;
+        resaleParty2BPS   = _party2BPS;
+        resaleResellerBPS = _resellerBPS;
+    }
 
     // ─── MISC SETTERS ─────────────────────────────────────────────────────
 
     function setParty2Username(string memory username) external {
-        require(msg.sender == party2.wallet, "Not party2");
+        if (!(msg.sender == party2.wallet)) revert NotParty2();
         party2.xaoUsername = username;
     }
 

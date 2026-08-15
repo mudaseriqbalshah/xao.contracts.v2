@@ -190,13 +190,30 @@ async function main() {
     }
 
     // ============================================
-    // 4. DEPLOY
+    // 3b. DEPLOY XAOTicketFactory (dependency)
+    // ============================================
+    // ShowContract no longer embeds XAOTicket's creation bytecode (EIP-170
+    // size limit). Tickets are deployed via this external factory, whose
+    // address is injected into ShowContractFactory's constructor and passed
+    // down to every ShowContract it creates.
+
+    log.section("Deploying XAOTicketFactory");
+    log.info("This may take a moment...");
+
+    const ticketFactoryCF = await hre.ethers.getContractFactory("XAOTicketFactory");
+    const ticketFactoryTx = await ticketFactoryCF.deploy();
+    const ticketFactoryDeployed = await ticketFactoryTx.waitForDeployment();
+    const ticketFactoryAddress = await ticketFactoryDeployed.getAddress();
+    log.success(`XAOTicketFactory deployed: ${colors.bright}${ticketFactoryAddress}${colors.reset}`);
+
+    // ============================================
+    // 4. DEPLOY ShowContractFactory (with ticket factory)
     // ============================================
 
     log.section("Deploying ShowContractFactory");
     log.info("This may take a moment...");
 
-    const deployTx = await factory.deploy();
+    const deployTx = await factory.deploy(ticketFactoryAddress);
     log.info(`Transaction sent: ${colors.cyan}${deployTx.deploymentTransaction().hash}${colors.reset}`);
 
     const deployed = await deployTx.waitForDeployment();

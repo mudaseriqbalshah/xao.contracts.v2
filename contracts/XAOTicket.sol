@@ -43,6 +43,7 @@ contract XAOTicket is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausable
         uint256    party1ResaleBPS;
         uint256    party2ResaleBPS;
         uint256    resellerBPS;
+        string     image;           // NFT artwork for this ticket type (IPFS/HTTP URI)
     }
 
     address public immutable showContract;
@@ -126,7 +127,8 @@ contract XAOTicket is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausable
         uint256       _onSaleTimestamp,
         uint256       _party1ResaleBPS,
         uint256       _party2ResaleBPS,
-        uint256       _resellerBPS
+        uint256       _resellerBPS,
+        string calldata _image
     ) external onlyRole(ADMIN_ROLE) returns (uint256 tierId) {
         require(_quantity > 0, "Zero quantity");
         require(
@@ -144,7 +146,8 @@ contract XAOTicket is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausable
             onSaleTimestamp: _onSaleTimestamp,
             party1ResaleBPS: _party1ResaleBPS,
             party2ResaleBPS: _party2ResaleBPS,
-            resellerBPS:     _resellerBPS
+            resellerBPS:     _resellerBPS,
+            image:           _image
         });
         tierCount++;
         emit TierAdded(tierId, _ticketType, _priceUSDC, _quantity);
@@ -287,6 +290,22 @@ contract XAOTicket is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausable
 
     function setMetadataDNSLink(string memory link) external onlyRole(ADMIN_ROLE) {
         metadataDNSLink = link;
+    }
+
+    /// @notice ERC-1155 metadata. Returns an on-chain JSON data URI whose
+    ///         `image` is the ticket type's artwork, so wallets and
+    ///         marketplaces render the NFT image without any external metadata
+    ///         hosting. `tokenId` maps to its tier via `tokenToTier`.
+    /// @dev    Assumes eventName / tier image contain no unescaped `"`.
+    function uri(uint256 tokenId) public view override returns (string memory) {
+        TicketTier storage tier = tiers[tokenToTier[tokenId]];
+        string memory tierName = bytes(tier.customName).length > 0 ? tier.customName : "Ticket";
+        return string(
+            abi.encodePacked(
+                'data:application/json;utf8,{"name":"', eventName, ' - ', tierName,
+                '","description":"XAO event ticket","image":"', tier.image, '"}'
+            )
+        );
     }
 
     function pause()   external onlyRole(ADMIN_ROLE) { _pause(); }

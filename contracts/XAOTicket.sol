@@ -6,6 +6,7 @@ import "@openzeppelin/contracts/token/common/ERC2981.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/utils/Base64.sol";
 import "./interfaces/IShowContract.sol";
 
 interface ITicketUSDC {
@@ -300,12 +301,16 @@ contract XAOTicket is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausable
     function uri(uint256 tokenId) public view override returns (string memory) {
         TicketTier storage tier = tiers[tokenToTier[tokenId]];
         string memory tierName = bytes(tier.customName).length > 0 ? tier.customName : "Ticket";
-        return string(
+        // base64-encoded data URI — the format wallets, marketplaces, and
+        // explorers reliably parse (the raw `;utf8,` variant is not universally
+        // supported).
+        string memory json = string(
             abi.encodePacked(
-                'data:application/json;utf8,{"name":"', eventName, ' - ', tierName,
+                '{"name":"', eventName, ' - ', tierName,
                 '","description":"XAO event ticket","image":"', tier.image, '"}'
             )
         );
+        return string(abi.encodePacked("data:application/json;base64,", Base64.encode(bytes(json))));
     }
 
     function pause()   external onlyRole(ADMIN_ROLE) { _pause(); }

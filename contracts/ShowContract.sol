@@ -215,7 +215,7 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
     // Collected by the create-contract UI but previously had no on-chain home.
     // Populated post-deploy while still Draft via the setters below
     // (onlyParty1, notFinalized), same pattern as the payment schedules.
-    string[] public genres;            // event genres (promotion.genres)
+    string[] internal genres;          // event genres (read via getGenres())
     uint256  public compTickets;       // complimentary ticket count (tickets.comps)
     uint256  public ticketsSaleDate;   // when tickets go on sale, unix (datesAndTimes.ticketsSale)
     // Default resale royalty split (BPS, must sum to 10000) — mirrors XAOTicket per-tier splits.
@@ -627,4 +627,22 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
 
     function pause()   external onlyRole(ADMIN_ROLE) { _pause(); }
     function unpause() external onlyRole(ADMIN_ROLE) { _unpause(); }
+
+    // ─── MULTICALL ────────────────────────────────────────────────────────
+
+    /// @notice Batch several calls to THIS contract in one transaction. Each
+    ///         entry is ABI-encoded calldata for a function on this contract;
+    ///         msg.sender is preserved (delegatecall to self) so `onlyParty1`
+    ///         still holds. Lets the client push all payment schedules + config
+    ///         in a single wallet confirmation instead of one per field.
+    function multicall(bytes[] calldata data) external returns (bytes[] memory results) {
+        results = new bytes[](data.length);
+        for (uint256 i = 0; i < data.length; i++) {
+            (bool ok, bytes memory ret) = address(this).delegatecall(data[i]);
+            if (!ok) {
+                assembly { revert(add(ret, 0x20), mload(ret)) }
+            }
+            results[i] = ret;
+        }
+    }
 }

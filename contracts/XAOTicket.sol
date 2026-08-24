@@ -119,7 +119,58 @@ contract XAOTicket is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausable
 
     // ─── TIER MANAGEMENT ─────────────────────────────────────────────────
 
-    /// @notice Add a new ticket tier. Only callable by ADMIN_ROLE (ShowContract or party1).
+    /// @dev Calldata-friendly shape of one tier, used by the batch `addTiers`.
+    struct TierInput {
+        TicketType ticketType;
+        string     customName;
+        uint256    priceUSDC;
+        uint256    quantity;
+        uint256    onSaleTimestamp;
+        uint256    party1ResaleBPS;
+        uint256    party2ResaleBPS;
+        uint256    resellerBPS;
+        string     image;
+    }
+
+    /// @dev Tier edits are allowed during negotiation only: either party (party1
+    ///      holds ADMIN_ROLE; party2 via the ShowContract party2() lookup) may
+    ///      add tiers, but once both parties sign (ShowContract.isFinalized())
+    ///      tiers are permanently frozen. This is what guarantees the ticket
+    ///      types bought are exactly those set before signing.
+    function _requireCanEditTiers() internal view {
+        IShowContract show = IShowContract(showContract);
+        require(!show.isFinalized(), "Tiers locked: contract signed");
+        if (!hasRole(ADMIN_ROLE, msg.sender)) {
+            (address p2, , ) = show.party2();
+            require(msg.sender == p2, "Not authorized");
+        }
+    }
+
+    /// @dev Stores one tier. No auth / no signature-reset — callers gate first.
+    function _addTierUnchecked(TierInput memory t) internal returns (uint256 tierId) {
+        require(t.quantity > 0, "Zero quantity");
+        require(
+            t.party1ResaleBPS + t.party2ResaleBPS + t.resellerBPS == 10_000,
+            "Resale BPS must sum to 10000"
+        );
+        tierId = tierCount;
+        tiers[tierId] = TicketTier({
+            ticketType:      t.ticketType,
+            customName:      t.customName,
+            priceUSDC:       t.priceUSDC,
+            quantity:        t.quantity,
+            sold:            0,
+            onSaleTimestamp: t.onSaleTimestamp,
+            party1ResaleBPS: t.party1ResaleBPS,
+            party2ResaleBPS: t.party2ResaleBPS,
+            resellerBPS:     t.resellerBPS,
+            image:           t.image
+        });
+        tierCount++;
+        emit TierAdded(tierId, t.ticketType, t.priceUSDC, t.quantity);
+    }
+
+    /// @notice Add a single ticket tier.
     function addTier(
         TicketType    _ticketType,
         string calldata _customName,
@@ -130,28 +181,34 @@ contract XAOTicket is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausable
         uint256       _party2ResaleBPS,
         uint256       _resellerBPS,
         string calldata _image
-    ) external onlyRole(ADMIN_ROLE) returns (uint256 tierId) {
-        require(_quantity > 0, "Zero quantity");
-        require(
-            _party1ResaleBPS + _party2ResaleBPS + _resellerBPS == 10_000,
-            "Resale BPS must sum to 10000"
-        );
-
-        tierId = tierCount;
-        tiers[tierId] = TicketTier({
+    ) external returns (uint256 tierId) {
+        _requireCanEditTiers();
+        tierId = _addTierUnchecked(TierInput({
             ticketType:      _ticketType,
             customName:      _customName,
             priceUSDC:       _priceUSDC,
             quantity:        _quantity,
-            sold:            0,
             onSaleTimestamp: _onSaleTimestamp,
             party1ResaleBPS: _party1ResaleBPS,
             party2ResaleBPS: _party2ResaleBPS,
             resellerBPS:     _resellerBPS,
             image:           _image
-        });
-        tierCount++;
-        emit TierAdded(tierId, _ticketType, _priceUSDC, _quantity);
+        }));
+        // A tier change during negotiation invalidates a prior signature on the
+        // show, so the signer must re-approve before the contract can finalize.
+        IShowContract(showContract).onTierChanged(msg.sender);
+    }
+
+    /// @notice Add many ticket tiers in ONE transaction (a single wallet
+    ///         confirmation), instead of one addTier call per tier. Same auth,
+    ///         same freeze rule, one signature-reset at the end.
+    function addTiers(TierInput[] calldata inputs) external returns (uint256[] memory ids) {
+        _requireCanEditTiers();
+        ids = new uint256[](inputs.length);
+        for (uint256 i = 0; i < inputs.length; i++) {
+            ids[i] = _addTierUnchecked(inputs[i]);
+        }
+        IShowContract(showContract).onTierChanged(msg.sender);
     }
 
     // ─── TICKET PURCHASE (lazy mint) ─────────────────────────────────────
@@ -164,6 +221,11 @@ contract XAOTicket is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausable
         whenNotPaused
         returns (uint256 tokenId)
     {
+        // No sales until BOTH parties have signed. The collection is deployed at
+        // contract creation (so tiers can be set during negotiation), so without
+        // this guard a past on-sale date could let tickets sell on an unsigned
+        // contract. isFinalized() flips true only when both parties have signed.
+        require(IShowContract(showContract).isFinalized(), "Contract not signed yet");
         require(tierId < tierCount, "Invalid tierId");
         TicketTier storage tier = tiers[tierId];
         require(block.timestamp >= tier.onSaleTimestamp, "Not on sale yet");

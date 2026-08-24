@@ -351,6 +351,16 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
 
         _grantRole(DEFAULT_ADMIN_ROLE, _p1.wallet);
         _grantRole(ADMIN_ROLE, _p1.wallet);
+
+        // Deploy the XAOTicket collection up-front (at creation) rather than on
+        // finalization, so ticket tiers can be defined during negotiation and
+        // are then frozen the moment both parties sign (XAOTicket.addTier gates
+        // on this contract's isFinalized()). party1 gets ADMIN_ROLE on the
+        // collection; party2 may still edit tiers pre-finalize via addTier's
+        // own party2 check.
+        if (ticketsEnabled) {
+            _deployTicketCollection();
+        }
     }
 
     // ─── SIGNING ──────────────────────────────────────────────────────────
@@ -358,7 +368,8 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
     /// @notice Sign the contract.
     ///         party1 signs first → PROPOSED.
     ///         party2 signs (PROPOSED or COUNTER_PROPOSED) → APPROVED.
-    ///         On APPROVED: isFinalized = true, XAOTicket deployed if ticketsEnabled.
+    ///         On APPROVED: isFinalized = true, which permanently freezes the
+    ///         XAOTicket tiers (the collection is deployed at creation, not here).
     function sign() external onlyParty whenNotPaused {
         if (!(!hasSigned[msg.sender])) revert AlreadySigned();
         if (!(!isFinalized)) revert AlreadyFinalized();
@@ -371,9 +382,8 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
         if (hasSigned[party1.wallet] && hasSigned[party2.wallet]) {
             isFinalized = true;
             status = Status.APPROVED;
-            if (ticketsEnabled) {
-                _deployTicketCollection();
-            }
+            // XAOTicket was already deployed at creation; setting isFinalized
+            // above is what permanently freezes its tiers (addTier now reverts).
             emit ContractFinalized(address(this), contractCIDHash);
         } else if (msg.sender == party1.wallet) {
             if (status == Status.DRAFT || status == Status.COUNTER_PROPOSED) {
@@ -419,16 +429,32 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
     {
         if (!(usdc.transferFrom(msg.sender, treasury, CONTRACT_EDIT_FEE))) revert EditFeeFailed();
 
-        if (status == Status.PROPOSED && msg.sender == party2.wallet) {
-            hasSigned[party1.wallet] = false;
-            status = Status.COUNTER_PROPOSED;
-        } else if (status == Status.COUNTER_PROPOSED && msg.sender == party1.wallet) {
-            hasSigned[party2.wallet] = false;
-            status = Status.PROPOSED;
-        }
+        _applyChangeReset(msg.sender);
 
         contractCIDHash = newCIDHash;
         emit ContractUpdated(address(this), newCIDHash, msg.sender);
+    }
+
+    /// @dev Shared "a change invalidates a prior signature" logic, used by both
+    ///      updateContractCID (terms change) and onTierChanged (ticket change).
+    ///      If party2 changed something while party1 had signed (PROPOSED) →
+    ///      reset party1 and drop to COUNTER_PROPOSED; symmetric for party1.
+    function _applyChangeReset(address editor) internal {
+        if (status == Status.PROPOSED && editor == party2.wallet) {
+            hasSigned[party1.wallet] = false;
+            status = Status.COUNTER_PROPOSED;
+        } else if (status == Status.COUNTER_PROPOSED && editor == party1.wallet) {
+            hasSigned[party2.wallet] = false;
+            status = Status.PROPOSED;
+        }
+    }
+
+    /// @notice Called by the ticket collection when a tier is added during
+    ///         negotiation. A tier change invalidates a prior signature exactly
+    ///         like a terms change, so the signer must re-approve before finalizing.
+    function onTierChanged(address editor) external {
+        if (!(msg.sender == ticketCollection)) revert NotTicketContract();
+        _applyChangeReset(editor);
     }
 
     // ─── CANCEL ───────────────────────────────────────────────────────────

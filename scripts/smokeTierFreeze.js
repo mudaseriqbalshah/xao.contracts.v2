@@ -1,5 +1,5 @@
-// Smoke test for the "tiers set at create, frozen after both sign" change.
-// Run: npx hardhat run scripts/smokeTierFreeze.js
+// Smoke test: ticket tiers are set BEFORE signing (while the show is DRAFT) and
+// can never be added afterward. Run: npx hardhat run scripts/smokeTierFreeze.js
 "use strict";
 const { ethers } = require("hardhat");
 
@@ -7,6 +7,7 @@ const USDC = (n) => ethers.parseUnits(String(n), 6);
 const DAY = 86400;
 const PartyRole = { PROMOTER: 0, ARTIST: 1 };
 const TicketType = { COMP: 0, PRESALE: 1, GA: 2, VIP: 3, CUSTOM: 4 };
+const Status = { DRAFT: 0, PROPOSED: 1, COUNTER_PROPOSED: 2, APPROVED: 3 };
 
 function assert(cond, msg) { if (!cond) throw new Error("ASSERT FAILED: " + msg); console.log("  ok:", msg); }
 async function expectRevert(p, label) {
@@ -45,84 +46,45 @@ async function main() {
   await show.waitForDeployment();
   console.log("ShowContract:", show.target);
 
-  // 1. Collection deployed at CREATE (not finalize)
+  // 1. Collection deployed at CREATE, show is DRAFT (nobody signed yet)
   const coll = await show.ticketCollection();
   assert(coll !== ethers.ZeroAddress, "ticketCollection deployed at create time");
   const ticket = await ethers.getContractAt("XAOTicket", coll);
-  assert((await show.isFinalized()) === false, "not finalized right after create");
+  assert(Number(await show.status()) === Status.DRAFT, "show is DRAFT after create");
 
-  // 2. party1 (ADMIN_ROLE) can add a tier during negotiation
-  await (await ticket.connect(p1).addTier(TicketType.GA, "", USDC(10), 50, now, 5000, 3000, 2000, "img1")).wait();
-  assert((await ticket.tierCount()) === 1n, "party1 added tier during negotiation");
+  const T = (type, price, qty) => [type, "", USDC(price), qty, now, 5000, 3000, 2000, "img"];
 
-  // 3. party2 (via party2 check, no ADMIN_ROLE) can also add a tier during negotiation
-  await (await ticket.connect(p2).addTier(TicketType.VIP, "", USDC(20), 25, now, 5000, 3000, 2000, "img2")).wait();
-  assert((await ticket.tierCount()) === 2n, "party2 added tier during negotiation");
+  // 2. party1 (ADMIN_ROLE) sets tiers while DRAFT — single + batch
+  await (await ticket.connect(p1).addTier(...T(TicketType.GA, 45, 400))).wait();
+  await (await ticket.connect(p1).addTiers([T(TicketType.VIP, 120, 100), T(TicketType.PRESALE, 30, 50)])).wait();
+  assert((await ticket.tierCount()) === 3n, "party1 set 3 tiers before signing (addTier + batch addTiers)");
 
-  // 4. A random third party cannot add a tier
-  await expectRevert(ticket.connect(buyer).addTier(TicketType.GA, "", USDC(1), 1, now, 5000, 3000, 2000, ""), "stranger addTier blocked");
+  // 3. party2 CANNOT add a tier (only ADMIN_ROLE / party1 may, and only in DRAFT)
+  await expectRevert(ticket.connect(p2).addTier(...T(TicketType.GA, 10, 10)), "party2 addTier blocked");
+  // 4. A stranger cannot add a tier
+  await expectRevert(ticket.connect(buyer).addTier(...T(TicketType.GA, 1, 1)), "stranger addTier blocked");
 
-  // 5. buyTicket before finalize is blocked (contract not signed)
+  // 5. buyTicket before finalize is blocked
   await usdc.mint(buyer.address, USDC(1000));
   await usdc.connect(buyer).approve(coll, USDC(1000));
   await expectRevert(ticket.connect(buyer).buyTicket(0), "buyTicket blocked before signing");
 
-  // 6. Both sign -> finalized
+  // 6. party1 signs -> status leaves DRAFT (PROPOSED)
   await (await show.connect(p1).sign()).wait();
+  assert(Number(await show.status()) === Status.PROPOSED, "status PROPOSED after party1 signs");
+
+  // 7. KEY: no more tiers can be added once signing has started — not even party1
+  await expectRevert(ticket.connect(p1).addTier(...T(TicketType.GA, 5, 5)), "party1 addTier frozen after signing (not DRAFT)");
+  assert((await ticket.tierCount()) === 3n, "tierCount stays 3 after party1 signs");
+
+  // 8. party2 signs -> finalized; still frozen
   await (await show.connect(p2).sign()).wait();
   assert((await show.isFinalized()) === true, "finalized after both sign");
+  await expectRevert(ticket.connect(p1).addTier(...T(TicketType.GA, 5, 5)), "addTier frozen after finalize too");
 
-  // 7. Tiers FROZEN after finalize (even party1 admin cannot add)
-  await expectRevert(ticket.connect(p1).addTier(TicketType.GA, "", USDC(5), 5, now, 5000, 3000, 2000, ""), "party1 addTier frozen after sign");
-  await expectRevert(ticket.connect(p2).addTier(TicketType.GA, "", USDC(5), 5, now, 5000, 3000, 2000, ""), "party2 addTier frozen after sign");
-  assert((await ticket.tierCount()) === 2n, "tierCount stays 2 after finalize");
-
-  // 8. buyTicket now works (finalized + on sale)
+  // 9. buyTicket now works (finalized + on sale)
   await (await ticket.connect(buyer).buyTicket(0)).wait();
   assert((await ticket.totalSold()) === 1n, "buyTicket works after signing");
-
-  // ── Scenario 2: tier change resets a prior signature ──────────────────
-  console.log("\n-- Scenario 2: tier change resets signature --");
-  const show2 = await Show.deploy(
-    p1Config, p2.address, PartyRole.ARTIST, dates, loc, tick, fin, promo,
-    usdc.target, treasury.address, ticketFactory.target,
-  );
-  await show2.waitForDeployment();
-  const ticket2 = await ethers.getContractAt("XAOTicket", await show2.ticketCollection());
-
-  // party1 signs first -> PROPOSED, party1 hasSigned = true
-  await (await show2.connect(p1).sign()).wait();
-  assert((await show2.status()) === 1n, "status PROPOSED after party1 signs");
-  assert((await show2.hasSigned(p1.address)) === true, "party1 signed");
-
-  // party2 adds a tier during negotiation -> resets party1's signature
-  await (await ticket2.connect(p2).addTier(TicketType.GA, "", USDC(10), 10, now, 5000, 3000, 2000, "img")).wait();
-  assert((await show2.hasSigned(p1.address)) === false, "party1 signature RESET after party2 tier change");
-  assert((await show2.status()) === 2n, "status COUNTER_PROPOSED after party2 tier change");
-
-  // party1 must re-sign, then party2 signs -> finalized
-  await (await show2.connect(p1).sign()).wait();
-  await (await show2.connect(p2).sign()).wait();
-  assert((await show2.isFinalized()) === true, "finalized after re-sign + party2 sign");
-
-  // ── Scenario 3: batch addTiers (one tx for many tiers) ────────────────
-  console.log("\n-- Scenario 3: batch addTiers --");
-  const show3 = await Show.deploy(
-    p1Config, p2.address, PartyRole.ARTIST, dates, loc, tick, fin, promo,
-    usdc.target, treasury.address, ticketFactory.target,
-  );
-  await show3.waitForDeployment();
-  const ticket3 = await ethers.getContractAt("XAOTicket", await show3.ticketCollection());
-
-  // TierInput = [ticketType, customName, priceUSDC, quantity, onSaleTimestamp,
-  //              party1ResaleBPS, party2ResaleBPS, resellerBPS, image]
-  const batch = [
-    [TicketType.GA, "", USDC(45), 400, now, 5000, 3000, 2000, "img-ga"],
-    [TicketType.VIP, "", USDC(120), 100, now, 5000, 3000, 2000, "img-vip"],
-    [TicketType.PRESALE, "", USDC(30), 50, now, 5000, 3000, 2000, "img-pre"],
-  ];
-  await (await ticket3.connect(p1).addTiers(batch)).wait();
-  assert((await ticket3.tierCount()) === 3n, "addTiers added 3 tiers in ONE tx");
 
   console.log("\nALL SMOKE ASSERTIONS PASSED ✅");
 }

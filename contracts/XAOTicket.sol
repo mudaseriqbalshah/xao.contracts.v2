@@ -132,18 +132,17 @@ contract XAOTicket is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausable
         string     image;
     }
 
-    /// @dev Tier edits are allowed during negotiation only: either party (party1
-    ///      holds ADMIN_ROLE; party2 via the ShowContract party2() lookup) may
-    ///      add tiers, but once both parties sign (ShowContract.isFinalized())
-    ///      tiers are permanently frozen. This is what guarantees the ticket
-    ///      types bought are exactly those set before signing.
+    /// @dev Tiers may only be added while the show is in DRAFT — i.e. BEFORE
+    ///      anyone has signed. The frontend adds the form's tiers in the same
+    ///      session it deploys the show and before it calls sign(), so those
+    ///      succeed; any attempt after the first signature (status leaves DRAFT)
+    ///      reverts. This guarantees the ticket types are exactly those set
+    ///      before signing — none can be added later. Restricted to ADMIN_ROLE
+    ///      (the show + party1).
     function _requireCanEditTiers() internal view {
-        IShowContract show = IShowContract(showContract);
-        require(!show.isFinalized(), "Tiers locked: contract signed");
-        if (!hasRole(ADMIN_ROLE, msg.sender)) {
-            (address p2, , ) = show.party2();
-            require(msg.sender == p2, "Not authorized");
-        }
+        require(hasRole(ADMIN_ROLE, msg.sender), "Not authorized");
+        // Status.DRAFT == 0 (see ShowContract.Status)
+        require(IShowContract(showContract).status() == 0, "Tiers locked: set them before signing");
     }
 
     /// @dev Stores one tier. No auth / no signature-reset — callers gate first.

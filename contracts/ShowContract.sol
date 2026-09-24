@@ -25,7 +25,6 @@ interface IXAOTicketFactory {
 }
 
 interface IXAOTicketAdmin {
-    function ADMIN_ROLE() external view returns (bytes32);
     function grantRole(bytes32 role, address account) external;
 }
 
@@ -409,8 +408,13 @@ contract ShowContract is AccessControl, ReentrancyGuard, Pausable {
             totalCapacity
         );
         ticketCollection = ticket;
-        // Grant party1 admin so they can add tiers and scanners
-        IXAOTicketAdmin(ticket).grantRole(IXAOTicketAdmin(ticket).ADMIN_ROLE(), party1.wallet);
+        // Grant party1 admin so they can add tiers and grant/revoke scanners,
+        // and make party1 (the promoter) a scanner by default so they can check
+        // tickets in at the door without a separate manual grant step. The role
+        // ids are keccak256 of the same strings XAOTicket uses, folded at
+        // compile time — no extra external getter calls.
+        IXAOTicketAdmin(ticket).grantRole(ADMIN_ROLE, party1.wallet);
+        IXAOTicketAdmin(ticket).grantRole(keccak256("SCANNER_ROLE"), party1.wallet);
         emit TicketCollectionDeployed(ticket);
     }
 

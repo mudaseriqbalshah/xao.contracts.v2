@@ -27,7 +27,9 @@
     "show:verify:sepolia": "hardhat run scripts/verifyShowContracts.js --network baseSepolia",
     "show:verify:base": "hardhat run scripts/verifyShowContracts.js --network base",
     "graph:deploy:sepolia": "hardhat run scripts/deployGraph.js --network baseSepolia",
-    "graph:deploy:base": "hardhat run scripts/deployGraph.js --network base"
+    "graph:deploy:base": "hardhat run scripts/deployGraph.js --network base",
+    "showbundle:deploy:sepolia": "hardhat run scripts/deployShowBundle.js --network baseSepolia",
+    "showbundle:deploy:base": "hardhat run scripts/deployShowBundle.js --network base"
   },
   "keywords": [
     "nft",

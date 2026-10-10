@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import "../interfaces/IGraphParties.sol";
 import "../interfaces/IGraphAuthorizer.sol";
+import "../interfaces/IGraphRegistrar.sol";
 
 /// @title TourParticipationAgreement (TPA) — one tour ↔ one participant (Phase 2A)
 /// @notice A 1–2 party agreement that attaches a band, sponsor or crew
@@ -10,7 +11,7 @@ import "../interfaces/IGraphAuthorizer.sol";
 ///         funds; money stays in show-level escrow. If a participant drops out,
 ///         only this contract changes state.
 /// @dev Deployed as a minimal-proxy clone by TourShell and set up via initialize().
-contract TourParticipationAgreement is IGraphParties, IGraphAuthorizer {
+contract TourParticipationAgreement is IGraphParties, IGraphAuthorizer, IGraphRegistrar {
 
     error AlreadyInitialized();
     error ZeroParty();
@@ -169,5 +170,11 @@ contract TourParticipationAgreement is IGraphParties, IGraphAuthorizer {
     /// @notice The tour shell registers this agreement's edges on its behalf.
     function isGraphOperator(address operator) external view override returns (bool) {
         return operator == tourShell;
+    }
+
+    /// @notice Only the tour manager may add shows under this agreement. The
+    ///         participant still confirms edges that need both parties.
+    function graphRegistrar() external view override returns (address) {
+        return partyA;
     }
 }

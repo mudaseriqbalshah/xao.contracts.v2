@@ -453,13 +453,21 @@ describe("Tour contracts", function () {
         .to.deep.equal([venue.address, artist.address]);
     });
 
-    it("also goes live at once for the participant band when it is a party on the show", async function () {
-      // band1 is partyB of the TPA and a party on the show, so it is authorized
-      // on both endpoints, the same standing the tour owner has.
+    it("does not let the participant band add a show by itself", async function () {
+      // band1 is partyB of the TPA and a party on the show. It can propose the
+      // link from the show side, but the tour owner still has to confirm it.
       const bandShow = await deployShow(venue.address, band1.address);
       const id = edgeIdOf(tpa.target, bandShow.target, EdgeType.PARENTS);
+      expect(await registry.isAuthorizedFor(tpa.target, band1.address)).to.equal(false);
+      expect(await registry.isAuthorizedFor(tpa.target, agent.address)).to.equal(true);
 
       await registry.connect(band1).registerEdge(tpa.target, bandShow.target, EdgeType.PARENTS, ZERO_BYTES32, "");
+      expect(await registry.edgeStatus(id)).to.equal(EdgeStatus.Pending);
+      expect(await registry.getRequiredConfirmersForEdge(id))
+        .to.deep.equal([agent.address, band1.address]);
+      expect(await registry.confirmedBy(id, band1.address)).to.equal(true);
+
+      await registry.connect(agent).confirmEdge(id);
       expect(await registry.edgeStatus(id)).to.equal(EdgeStatus.Active);
     });
   });

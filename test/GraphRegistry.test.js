@@ -164,6 +164,51 @@ describe("GraphRegistry", function () {
     });
   });
 
+  describe("Nodes that name a registrar", function () {
+    let node;
+
+    beforeEach(async function () {
+      const F = await ethers.getContractFactory("MockRegistrarNode");
+      node = await F.deploy(agent.address, band.address, agent.address);
+      await node.waitForDeployment();
+    });
+
+    it("lets only the registrar register on the node's behalf", async function () {
+      expect(await registry.isAuthorizedFor(node.target, agent.address)).to.equal(true);
+      expect(await registry.isAuthorizedFor(node.target, band.address)).to.equal(false);
+
+      await registry.connect(agent).registerEdge(node.target, module_.address, EdgeType.HAS_MODULE, ZERO_BYTES32, "");
+      await expect(
+        registry.connect(band).registerEdge(node.target, module_.address, EdgeType.HAS_MODULE, ethers.id("b"), "")
+      ).to.be.revertedWithCustomError(registry, "NotAuthorized");
+    });
+
+    it("still asks both parties to confirm", async function () {
+      expect(await registry.getRequiredConfirmersForNode(node.target))
+        .to.deep.equal([agent.address, band.address]);
+    });
+
+    it("accepts an operator of a registrar that is an org wallet", async function () {
+      const Org = await ethers.getContractFactory("MockOrgWallet");
+      const org = await Org.deploy();
+      await org.waitForDeployment();
+      await org.setOperator(operator.address, true);
+      const F = await ethers.getContractFactory("MockRegistrarNode");
+      const orgNode = await F.deploy(org.target, band.address, org.target);
+      await orgNode.waitForDeployment();
+
+      expect(await registry.isAuthorizedFor(orgNode.target, operator.address)).to.equal(true);
+      expect(await registry.isAuthorizedFor(orgNode.target, band.address)).to.equal(false);
+    });
+
+    it("falls back to the party rule when the registrar is unset", async function () {
+      const F = await ethers.getContractFactory("MockRegistrarNode");
+      const openNode = await F.deploy(agent.address, band.address, ZERO_ADDRESS);
+      await openNode.waitForDeployment();
+      expect(await registry.isAuthorizedFor(openNode.target, band.address)).to.equal(true);
+    });
+  });
+
   describe("Immediate edges (HAS_MODULE)", function () {
     it("is Active on registration with no confirmers", async function () {
       const show = await deployNode(venue.address, artist.address);

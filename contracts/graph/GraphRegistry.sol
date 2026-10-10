@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import "../interfaces/IGraphParties.sol";
 import "../interfaces/IGraphAuthorizer.sol";
+import "../interfaces/IGraphRegistrar.sol";
 import "../interfaces/IGraphRegistry.sol";
 
 /// @title GraphRegistry — typed, append-only edges between XAO contract nodes (Phase 2A)
@@ -185,9 +186,14 @@ contract GraphRegistry is IGraphRegistry {
     /// @notice True when `caller` may register or supersede edges touching `node`:
     ///         the node itself, an operator the node names, one of the node's
     ///         parties, or an operator of a party that is an org wallet.
+    ///         A node that names a registrar (IGraphRegistrar) narrows the
+    ///         party rule to that one address.
     function isAuthorizedFor(address node, address caller) public view returns (bool) {
         if (caller == node) return true;
         if (_isOperator(node, caller)) return true;
+
+        address registrar = _registrar(node);
+        if (registrar != address(0)) return _actsAs(registrar, caller);
 
         (address a, address b, bool isPartyNode) = _parties(node);
         if (!isPartyNode) return false;
@@ -316,6 +322,16 @@ contract GraphRegistry is IGraphRegistry {
             abi.encodeCall(IGraphAuthorizer.isGraphOperator, (operator))
         );
         return ok && data.length >= 32 && uint256(bytes32(data)) != 0;
+    }
+
+    /// @dev Zero when the node does not name a registrar.
+    function _registrar(address node) internal view returns (address) {
+        if (node.code.length == 0) return address(0);
+        (bool ok, bytes memory data) = node.staticcall(
+            abi.encodeCall(IGraphRegistrar.graphRegistrar, ())
+        );
+        if (!ok || data.length < 32) return address(0);
+        return address(uint160(uint256(bytes32(data))));
     }
 
     function _parties(address node) internal view returns (address a, address b, bool isPartyNode) {

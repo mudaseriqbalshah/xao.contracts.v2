@@ -146,6 +146,8 @@ contract TourShell is IGraphParties, IGraphAuthorizer {
     /// @dev A tour owner who is also a party on the show does not need this:
     ///      registering the same two edges directly in GraphRegistry makes them
     ///      Active at once, because the owner is authorized on both endpoints.
+    ///      The participant cannot do the same; each TPA names the tour owner
+    ///      as its only registrar.
     function linkShowToTPA(
         address tpa,
         address eventRoot,

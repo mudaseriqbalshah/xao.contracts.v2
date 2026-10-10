@@ -12,7 +12,10 @@ interface IGraphRegistry {
         SPONSORED_BY,   // Instance -> SponsorContract
         UNDER_TOUR,     // optional alias of CHILD_OF
         UNDER_STAKING,  // reserved for Phase 3 staking parents
-        REPLACES        // reserved for replacement relationships
+        REPLACES,       // reserved for replacement relationships
+        PARTICIPATES_AS, // Org/User -> Instance; the role goes in the edge metadata
+        OWNED_BY,       // Contract -> Org/Wallet that owns it
+        OPERATED_BY     // Contract -> User with operational authority
     }
 
     enum EdgeStatus { None, Pending, Active, Inactive }

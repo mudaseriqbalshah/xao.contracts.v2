@@ -11,6 +11,7 @@ const ZERO_ADDRESS = ethers.ZeroAddress;
 const EdgeType = {
   HAS_MODULE: 0, CHILD_OF: 1, PARENTS: 2, APPLIES_TO: 3,
   SPONSORED_BY: 4, UNDER_TOUR: 5, UNDER_STAKING: 6, REPLACES: 7,
+  PARTICIPATES_AS: 8, OWNED_BY: 9, OPERATED_BY: 10,
 };
 const EdgeStatus   = { None: 0, Pending: 1, Active: 2, Inactive: 3 };
 const ConfirmPolicy = { Immediate: 0, Counterparty: 1, AllParties: 2 };
@@ -59,6 +60,9 @@ describe("GraphRegistry", function () {
       expect(await registry.confirmPolicy(EdgeType.APPLIES_TO)).to.equal(ConfirmPolicy.AllParties);
       expect(await registry.confirmPolicy(EdgeType.SPONSORED_BY)).to.equal(ConfirmPolicy.AllParties);
       expect(await registry.confirmPolicy(EdgeType.REPLACES)).to.equal(ConfirmPolicy.AllParties);
+      expect(await registry.confirmPolicy(EdgeType.PARTICIPATES_AS)).to.equal(ConfirmPolicy.Counterparty);
+      expect(await registry.confirmPolicy(EdgeType.OWNED_BY)).to.equal(ConfirmPolicy.Counterparty);
+      expect(await registry.confirmPolicy(EdgeType.OPERATED_BY)).to.equal(ConfirmPolicy.Counterparty);
     });
 
     it("reports which edge types need all parties to confirm", async function () {
@@ -311,6 +315,79 @@ describe("GraphRegistry", function () {
       await registry.connect(artist).confirmEdge(edgeId);
       await expect(registry.connect(venue).confirmEdge(edgeId))
         .to.be.revertedWithCustomError(registry, "EdgeNotPending");
+    });
+  });
+
+  describe("Role and authority edges (PARTICIPATES_AS / OWNED_BY / OPERATED_BY)", function () {
+    let show;
+    const headliner = ethers.id("role:headliner");
+
+    beforeEach(async function () {
+      show = await deployNode(venue.address, artist.address);
+    });
+
+    it("a show party names a participant, who has to confirm the role", async function () {
+      const id = edgeIdOf(band.address, show.target, EdgeType.PARTICIPATES_AS, headliner);
+      await registry.connect(venue)
+        .registerEdge(band.address, show.target, EdgeType.PARTICIPATES_AS, headliner, "ipfs://role");
+
+      expect(await registry.edgeStatus(id)).to.equal(EdgeStatus.Pending);
+      expect(await registry.getRequiredConfirmersForEdge(id)).to.deep.equal([band.address]);
+
+      await registry.connect(band).confirmEdge(id);
+      expect(await registry.edgeStatus(id)).to.equal(EdgeStatus.Active);
+      expect((await registry.edges(id)).metaCID).to.equal("ipfs://role");
+    });
+
+    it("a participant claiming a role waits for the show's parties", async function () {
+      const id = edgeIdOf(band.address, show.target, EdgeType.PARTICIPATES_AS, headliner);
+      await registry.connect(band)
+        .registerEdge(band.address, show.target, EdgeType.PARTICIPATES_AS, headliner, "");
+
+      expect(await registry.getRequiredConfirmersForEdge(id))
+        .to.deep.equal([venue.address, artist.address]);
+      await registry.connect(venue).confirmEdge(id);
+      expect(await registry.edgeStatus(id)).to.equal(EdgeStatus.Pending);
+      await registry.connect(artist).confirmEdge(id);
+      expect(await registry.edgeStatus(id)).to.equal(EdgeStatus.Active);
+    });
+
+    it("is Active at once when a show party records its own role", async function () {
+      const id = edgeIdOf(artist.address, show.target, EdgeType.PARTICIPATES_AS, headliner);
+      await registry.connect(artist)
+        .registerEdge(artist.address, show.target, EdgeType.PARTICIPATES_AS, headliner, "");
+      expect(await registry.edgeStatus(id)).to.equal(EdgeStatus.Active);
+    });
+
+    it("an ownership or operator claim needs the named owner or operator to agree", async function () {
+      const Org = await ethers.getContractFactory("MockOrgWallet");
+      const org = await Org.deploy();
+      await org.waitForDeployment();
+      await org.setOperator(operator.address, true);
+
+      const ownedId = edgeIdOf(show.target, org.target, EdgeType.OWNED_BY);
+      await registry.connect(venue).registerEdge(show.target, org.target, EdgeType.OWNED_BY, ZERO_BYTES32, "");
+      expect(await registry.edgeStatus(ownedId)).to.equal(EdgeStatus.Pending);
+      await expect(registry.connect(stranger).confirmEdge(ownedId))
+        .to.be.revertedWithCustomError(registry, "NothingToConfirm");
+      await registry.connect(operator).confirmEdge(ownedId);
+      expect(await registry.edgeStatus(ownedId)).to.equal(EdgeStatus.Active);
+
+      const operatedId = edgeIdOf(show.target, stranger.address, EdgeType.OPERATED_BY);
+      await registry.connect(venue)
+        .registerEdge(show.target, stranger.address, EdgeType.OPERATED_BY, ZERO_BYTES32, "");
+      expect(await registry.edgeStatus(operatedId)).to.equal(EdgeStatus.Pending);
+      await registry.connect(stranger).confirmEdge(operatedId);
+      expect(await registry.edgeStatus(operatedId)).to.equal(EdgeStatus.Active);
+    });
+
+    it("a stranger cannot claim to own someone else's contract", async function () {
+      const id = edgeIdOf(show.target, stranger.address, EdgeType.OWNED_BY);
+      await registry.connect(stranger)
+        .registerEdge(show.target, stranger.address, EdgeType.OWNED_BY, ZERO_BYTES32, "");
+      expect(await registry.edgeStatus(id)).to.equal(EdgeStatus.Pending);
+      expect(await registry.getRequiredConfirmersForEdge(id))
+        .to.deep.equal([venue.address, artist.address]);
     });
   });
 

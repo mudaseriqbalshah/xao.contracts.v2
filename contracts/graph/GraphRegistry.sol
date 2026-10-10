@@ -63,6 +63,11 @@ contract GraphRegistry is IGraphRegistry {
         confirmPolicy[EdgeType.APPLIES_TO]    = ConfirmPolicy.AllParties;
         confirmPolicy[EdgeType.SPONSORED_BY]  = ConfirmPolicy.AllParties;
         confirmPolicy[EdgeType.REPLACES]      = ConfirmPolicy.AllParties;
+        // Role and authority claims name someone else, so the side that did
+        // not register the edge has to confirm it.
+        confirmPolicy[EdgeType.PARTICIPATES_AS] = ConfirmPolicy.Counterparty;
+        confirmPolicy[EdgeType.OWNED_BY]        = ConfirmPolicy.Counterparty;
+        confirmPolicy[EdgeType.OPERATED_BY]     = ConfirmPolicy.Counterparty;
     }
 
     // ─── WRITES ───────────────────────────────────────────────────────────

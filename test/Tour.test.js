@@ -118,9 +118,32 @@ describe("Tour contracts", function () {
       );
       expect(await shell.tourId()).to.equal(derived);
 
-      const supplied = ethers.id("my-tour");
-      const shell2 = await createShell(factory, agent, supplied);
-      expect(await shell2.tourId()).to.equal(supplied);
+      // A client-chosen id is tied to its creator.
+      const chosen = ethers.id("my-tour");
+      const expected = ethers.solidityPackedKeccak256(["address", "bytes32"], [agent.address, chosen]);
+      const shell2 = await createShell(factory, agent, chosen);
+      expect(await shell2.tourId()).to.equal(expected);
+    });
+
+    it("deploys each shell at the address predicted from its tour id", async function () {
+      const chosen = ethers.id("predictable-tour");
+      const id = await factory.deriveTourId(agent.address, chosen, TOUR_META_CID, TOUR_META_HASH);
+      const predicted = await factory.predictTourShell(id);
+
+      const shell2 = await createShell(factory, agent, chosen);
+      expect(shell2.target).to.equal(predicted);
+      expect(await factory.tourById(id)).to.equal(shell2.target);
+      expect(await factory.tourById(await shell.tourId())).to.equal(shell.target);
+    });
+
+    it("cannot create the same tour twice, and nobody can take another owner's id", async function () {
+      await expect(factory.connect(agent).createTourShell(ZERO_BYTES32, TOUR_META_CID, TOUR_META_HASH))
+        .to.be.reverted;
+
+      const chosen = ethers.id("shared-name");
+      const theirs = await createShell(factory, stranger, chosen);
+      const mine   = await createShell(factory, agent, chosen);
+      expect(theirs.target).to.not.equal(mine.target);
     });
   });
 

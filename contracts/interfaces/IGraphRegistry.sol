@@ -25,6 +25,14 @@ interface IGraphRegistry {
     ///      AllParties   — Pending until all parties of both endpoints confirm.
     enum ConfirmPolicy { Immediate, Counterparty, AllParties }
 
+    struct EdgeInput {
+        address  from;
+        address  to;
+        EdgeType edgeType;
+        bytes32  metaHash;
+        string   metaCID;
+    }
+
     event EdgeRegistered(
         bytes32 indexed edgeId,
         address indexed from,
@@ -43,6 +51,8 @@ interface IGraphRegistry {
         bytes32 metaHash,
         string calldata metaCID
     ) external returns (bytes32 edgeId);
+
+    function registerEdges(EdgeInput[] calldata inputs) external returns (bytes32[] memory edgeIds);
 
     function confirmEdge(bytes32 edgeId) external;
 

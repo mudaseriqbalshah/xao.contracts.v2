@@ -76,6 +76,30 @@ contract GraphRegistry is IGraphRegistry {
         bytes32 metaHash,
         string calldata metaCID
     ) external override returns (bytes32 edgeId) {
+        return _registerEdge(from, to, edgeType, metaHash, metaCID);
+    }
+
+    /// @notice Register several edges in one transaction, e.g. both directions
+    ///         of a parent/child link. Each edge follows the registerEdge rules.
+    function registerEdges(EdgeInput[] calldata inputs)
+        external
+        override
+        returns (bytes32[] memory edgeIds)
+    {
+        edgeIds = new bytes32[](inputs.length);
+        for (uint256 i = 0; i < inputs.length; i++) {
+            EdgeInput calldata e = inputs[i];
+            edgeIds[i] = _registerEdge(e.from, e.to, e.edgeType, e.metaHash, e.metaCID);
+        }
+    }
+
+    function _registerEdge(
+        address from,
+        address to,
+        EdgeType edgeType,
+        bytes32 metaHash,
+        string memory metaCID
+    ) internal returns (bytes32 edgeId) {
         if (from == address(0) || to == address(0)) revert ZeroAddress();
         if (from == to) revert SelfEdge();
 

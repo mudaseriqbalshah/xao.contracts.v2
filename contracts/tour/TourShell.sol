@@ -143,6 +143,9 @@ contract TourShell is IGraphParties, IGraphAuthorizer {
 
     /// @notice Start linking a show under one of this tour's TPAs. Both edges
     ///         stay Pending in GraphRegistry until the show's parties confirm.
+    /// @dev A tour owner who is also a party on the show does not need this:
+    ///      registering the same two edges directly in GraphRegistry makes them
+    ///      Active at once, because the owner is authorized on both endpoints.
     function linkShowToTPA(
         address tpa,
         address eventRoot,

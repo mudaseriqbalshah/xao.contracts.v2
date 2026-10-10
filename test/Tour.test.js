@@ -422,5 +422,45 @@ describe("Tour contracts", function () {
         registry.connect(stranger).registerEdge(tpa.target, show.target, EdgeType.PARENTS, ZERO_BYTES32, "")
       ).to.be.revertedWithCustomError(registry, "NotAuthorized");
     });
+
+    it("goes live at once when the tour owner is already a party on the show", async function () {
+      const ownShow = await deployShow(venue.address, agent.address);
+      const ids = [
+        edgeIdOf(tpa.target, ownShow.target, EdgeType.PARENTS),
+        edgeIdOf(ownShow.target, tpa.target, EdgeType.CHILD_OF),
+      ];
+
+      await registry.connect(agent).registerEdges([
+        { from: tpa.target, to: ownShow.target, edgeType: EdgeType.PARENTS, metaHash: ZERO_BYTES32, metaCID: "" },
+        { from: ownShow.target, to: tpa.target, edgeType: EdgeType.CHILD_OF, metaHash: ZERO_BYTES32, metaCID: "" },
+      ]);
+
+      for (const id of ids) {
+        expect(await registry.edgeStatus(id)).to.equal(EdgeStatus.Active);
+        expect(await registry.getRequiredConfirmersForEdge(id)).to.deep.equal([]);
+      }
+    });
+
+    it("still needs the show's parties when the tour owner is not a party on the show", async function () {
+      await registry.connect(agent).registerEdges([
+        { from: tpa.target, to: show.target, edgeType: EdgeType.PARENTS, metaHash: ZERO_BYTES32, metaCID: "" },
+        { from: show.target, to: tpa.target, edgeType: EdgeType.CHILD_OF, metaHash: ZERO_BYTES32, metaCID: "" },
+      ]);
+
+      expect(await registry.edgeStatus(parentsId)).to.equal(EdgeStatus.Pending);
+      expect(await registry.edgeStatus(childOfId)).to.equal(EdgeStatus.Pending);
+      expect(await registry.getRequiredConfirmersForEdge(parentsId))
+        .to.deep.equal([venue.address, artist.address]);
+    });
+
+    it("also goes live at once for the participant band when it is a party on the show", async function () {
+      // band1 is partyB of the TPA and a party on the show, so it is authorized
+      // on both endpoints, the same standing the tour owner has.
+      const bandShow = await deployShow(venue.address, band1.address);
+      const id = edgeIdOf(tpa.target, bandShow.target, EdgeType.PARENTS);
+
+      await registry.connect(band1).registerEdge(tpa.target, bandShow.target, EdgeType.PARENTS, ZERO_BYTES32, "");
+      expect(await registry.edgeStatus(id)).to.equal(EdgeStatus.Active);
+    });
   });
 });

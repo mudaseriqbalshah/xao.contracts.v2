@@ -37,6 +37,7 @@ contract EventEscrow is ReentrancyGuard {
     error NotFinalized();
     error Frozen();
     error NotFrozen();
+    error DisputeNotExpired();
     error ShowAlreadyEnded();
     error MilestoneNotMissed();
     error InvalidBatchSize();
@@ -116,6 +117,10 @@ contract EventEscrow is ReentrancyGuard {
 
     uint256 public constant MAX_BATCH = 200;
 
+    /// @notice A dispute nobody settles ends with no breach after this long.
+    ///         A stop-gap until the ArbitrationAgent exists.
+    uint256 public constant DISPUTE_TIMEOUT = 30 days;
+
     // ─── STATE ────────────────────────────────────────────────────────────
     bytes32 public showId;
     IShowInstanceLike public show;
@@ -164,6 +169,7 @@ contract EventEscrow is ReentrancyGuard {
     // Dispute
     bytes32 public activeCaseId;
     uint256 public disputeNonce;
+    uint64  public disputeOpenedAt;
     mapping(bytes32 => mapping(address => Resolution)) public resolutionVote;
 
     bool public initialized;
@@ -185,6 +191,7 @@ contract EventEscrow is ReentrancyGuard {
     event DisputeRaised(bytes32 indexed caseId, address indexed by);
     event DisputeVoted(bytes32 indexed caseId, address indexed by, Resolution resolution);
     event DisputeSettled(bytes32 indexed caseId, Resolution resolution);
+    event DisputeTimedOut(bytes32 indexed caseId);
 
     event PaymentHeld(address indexed recipient, uint256 amount);
     event Claimed(address indexed recipient, uint256 amount);
@@ -461,6 +468,7 @@ contract EventEscrow is ReentrancyGuard {
 
         bytes32 caseId = keccak256(abi.encodePacked(showId, ++disputeNonce));
         activeCaseId = caseId;
+        disputeOpenedAt = uint64(block.timestamp);
         show.onDisputeOpened(caseId);
         emit DisputeRaised(caseId, msg.sender);
     }
@@ -481,6 +489,7 @@ contract EventEscrow is ReentrancyGuard {
         }
 
         activeCaseId = bytes32(0);
+        disputeOpenedAt = 0;
         show.onDisputeResolved(caseId);
         emit DisputeSettled(caseId, resolution);
 
@@ -491,6 +500,20 @@ contract EventEscrow is ReentrancyGuard {
         _pay(resolution == Resolution.ReleaseToPartyA ? partyA : partyB, distributable());
         emit EscrowCompleted();
         show.onCompleted();
+    }
+
+    /// @notice A dispute that nobody settled in DISPUTE_TIMEOUT ends with no
+    ///         breach: the freeze lifts and the escrow carries on under the
+    ///         terms it was created with. Anyone may call.
+    function finalizeDisputeTimeout() external nonReentrant {
+        bytes32 caseId = activeCaseId;
+        if (caseId == bytes32(0)) revert NotFrozen();
+        if (block.timestamp < uint256(disputeOpenedAt) + DISPUTE_TIMEOUT) revert DisputeNotExpired();
+
+        activeCaseId = bytes32(0);
+        disputeOpenedAt = 0;
+        show.onDisputeResolved(caseId);
+        emit DisputeTimedOut(caseId);
     }
 
     // ─── AFTER COMPLETION ─────────────────────────────────────────────────
@@ -585,6 +608,11 @@ contract EventEscrow is ReentrancyGuard {
     }
 
     // ─── VIEWS ────────────────────────────────────────────────────────────
+
+    /// @notice When the open dispute times out, or zero when there is none.
+    function disputeDeadline() external view returns (uint256) {
+        return activeCaseId == bytes32(0) ? 0 : uint256(disputeOpenedAt) + DISPUTE_TIMEOUT;
+    }
 
     function escrowBalance() public view returns (uint256) {
         return payoutToken.balanceOf(address(this));

@@ -1111,6 +1111,78 @@ describe("Show bundle", function () {
       expect(await show.status()).to.equal(ShowStatus.Completed);
     });
 
+    it("ends a dispute nobody settled after 30 days, with no breach", async function () {
+      const DAY = 24 * 60 * 60;
+      await escrow.connect(artist).raiseDispute();
+      await escrow.connect(artist).resolveDispute(Resolution.ReleaseToPartyB);   // only one side votes
+      const opened = await escrow.disputeOpenedAt();
+      expect(await escrow.disputeDeadline()).to.equal(opened + BigInt(30 * DAY));
+      expect(await escrow.DISPUTE_TIMEOUT()).to.equal(30 * DAY);
+
+      await expect(escrow.connect(stranger).finalizeDisputeTimeout())
+        .to.be.revertedWithCustomError(escrow, "DisputeNotExpired");
+      await time.increaseTo(Number(opened) + 30 * DAY - 10);
+      await expect(escrow.connect(stranger).finalizeDisputeTimeout())
+        .to.be.revertedWithCustomError(escrow, "DisputeNotExpired");
+
+      await time.increaseTo(Number(opened) + 30 * DAY);
+      const balance = await escrow.escrowBalance();
+      await expect(escrow.connect(stranger).finalizeDisputeTimeout())
+        .to.emit(escrow, "DisputeTimedOut")
+        .and.to.emit(show, "DisputeResolved");
+
+      // No breach: nothing was paid out, the freeze is lifted and the escrow carries on.
+      expect(await escrow.escrowBalance()).to.equal(balance);
+      expect(await show.isFrozen()).to.equal(false);
+      expect(await show.status()).to.equal(ShowStatus.Signed);
+      expect(await escrow.status()).to.equal(EscrowStatus.Active);
+      expect(await escrow.disputeDeadline()).to.equal(0);
+      await escrow.connect(promoter).deposit(USDC(1));
+      await buy(fan2);
+    });
+
+    it("cannot be finalized without a dispute, or twice", async function () {
+      await expect(escrow.connect(stranger).finalizeDisputeTimeout())
+        .to.be.revertedWithCustomError(escrow, "NotFrozen");
+
+      await escrow.connect(artist).raiseDispute();
+      await time.increase(30 * 24 * 60 * 60);
+      await escrow.connect(stranger).finalizeDisputeTimeout();
+      await expect(escrow.connect(stranger).finalizeDisputeTimeout())
+        .to.be.revertedWithCustomError(escrow, "NotFrozen");
+    });
+
+    it("lets a party settle by agreement before the timeout instead", async function () {
+      await escrow.connect(artist).raiseDispute();
+      await escrow.connect(artist).resolveDispute(Resolution.Resume);
+      await escrow.connect(promoter).resolveDispute(Resolution.Resume);
+      expect(await escrow.disputeDeadline()).to.equal(0);
+      await time.increase(31 * 24 * 60 * 60);
+      await expect(escrow.connect(stranger).finalizeDisputeTimeout())
+        .to.be.revertedWithCustomError(escrow, "NotFrozen");
+    });
+
+    it("lets the final sweep run once a freeze that outlasted the show times out", async function () {
+      await time.increaseTo(cfg.dates.showEndTime - 1_000);
+      await escrow.connect(promoter).raiseDispute();
+      await time.increaseTo(cfg.dates.showEndTime + 1);
+      await expect(escrow.connect(stranger).executeFinalSweep())
+        .to.be.revertedWithCustomError(escrow, "Frozen");
+
+      await time.increase(30 * 24 * 60 * 60);
+      await escrow.connect(stranger).finalizeDisputeTimeout();
+      await escrow.connect(stranger).executeFinalSweep();
+      expect(await escrow.status()).to.equal(EscrowStatus.Completed);
+      expect(await show.status()).to.equal(ShowStatus.Completed);
+    });
+
+    it("cannot be raised once the contract is closed", async function () {
+      await time.increaseTo(cfg.dates.showEndTime);
+      await escrow.connect(stranger).executeFinalSweep();
+      await expect(escrow.connect(promoter).raiseDispute())
+        .to.be.revertedWithCustomError(escrow, "NotActive");
+    });
+
     it("has nothing to resolve when there is no dispute", async function () {
       await expect(escrow.connect(promoter).resolveDispute(Resolution.Resume))
         .to.be.revertedWithCustomError(escrow, "NotFrozen");

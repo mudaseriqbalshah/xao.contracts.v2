@@ -300,21 +300,28 @@ describe("Tour contracts", function () {
       await expect(tpa.connect(band1).sign()).to.be.revertedWithCustomError(tpa, "NotDraft");
     });
 
-    it("terminates only when both parties agree", async function () {
+    it("lets either party end it on its own", async function () {
       await tpa.connect(agent).sign();
       await tpa.connect(band1).sign();
 
-      await expect(tpa.connect(band1).terminate("ipfs://reason"))
-        .to.emit(tpa, "TerminationRequested").withArgs(band1.address, "ipfs://reason");
-      expect(await tpa.status()).to.equal(TPAStatus.Active);
-      await expect(tpa.connect(band1).terminate("ipfs://reason"))
-        .to.be.revertedWithCustomError(tpa, "AlreadyVoted");
+      await expect(tpa.connect(stranger).terminate("")).to.be.revertedWithCustomError(tpa, "NotAParty");
 
-      await expect(tpa.connect(agent).terminate("ipfs://agreed"))
-        .to.emit(tpa, "Terminated").withArgs("ipfs://agreed");
+      await expect(tpa.connect(band1).terminate("ipfs://reason"))
+        .to.emit(tpa, "Terminated").withArgs(band1.address, "ipfs://reason");
       expect(await tpa.status()).to.equal(TPAStatus.Terminated);
+      expect(await tpa.terminatedBy()).to.equal(band1.address);
 
       await expect(tpa.connect(agent).terminate("")).to.be.revertedWithCustomError(tpa, "NotDraftOrActive");
+    });
+
+    it("lets the tour owner end it, and lets either party end it before it is signed", async function () {
+      await tpa.connect(agent).terminate("ipfs://changed-plans");
+      expect(await tpa.status()).to.equal(TPAStatus.Terminated);
+      expect(await tpa.terminatedBy()).to.equal(agent.address);
+
+      const tpa2 = await createTPA(shell, agent, band2.address);
+      await tpa2.connect(band2).terminate("");
+      expect(await tpa2.status()).to.equal(TPAStatus.Terminated);
     });
 
     it("leaves the tour and the other bands untouched when one band drops out", async function () {
@@ -326,7 +333,6 @@ describe("Tour contracts", function () {
       await tpa2.connect(band2).sign();
 
       await tpa2.connect(band2).terminate("");
-      await tpa2.connect(agent).terminate("");
 
       expect(await tpa2.status()).to.equal(TPAStatus.Terminated);
       expect(await tpa.status()).to.equal(TPAStatus.Active);

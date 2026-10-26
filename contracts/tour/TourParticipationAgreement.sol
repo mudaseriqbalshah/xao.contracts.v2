@@ -22,7 +22,6 @@ contract TourParticipationAgreement is IGraphParties, IGraphAuthorizer, IGraphRe
     error NotActive();
     error NotDraftOrActive();
     error AlreadySigned();
-    error AlreadyVoted();
     error ZeroAddress();
     error NewTPADoesNotPointBack();
 
@@ -45,7 +44,7 @@ contract TourParticipationAgreement is IGraphParties, IGraphAuthorizer, IGraphRe
     Status public status;
 
     mapping(address => bool) public hasSigned;
-    mapping(address => bool) public hasVotedTerminate;
+    address public terminatedBy;
     mapping(address => address) public supersedeVote;   // party => proposed new TPA
 
     address public supersedes;
@@ -62,8 +61,7 @@ contract TourParticipationAgreement is IGraphParties, IGraphAuthorizer, IGraphRe
     );
     event Signed(address indexed by);
     event Activated();
-    event TerminationRequested(address indexed by, string reasonCID);
-    event Terminated(string reasonCID);
+    event Terminated(address indexed by, string reasonCID);
     event SupersedeRequested(address indexed by, address indexed newTPA);
     event Superseded(address indexed newTPA);
 
@@ -130,18 +128,14 @@ contract TourParticipationAgreement is IGraphParties, IGraphAuthorizer, IGraphRe
 
     // ─── TERMINATION ──────────────────────────────────────────────────────
 
-    /// @notice Both parties must call this for the agreement to end.
+    /// @notice Either party can end the agreement on its own. This affects only
+    ///         this agreement; the tour and every other participant stay as they are.
     function terminate(string calldata reasonCID) external onlyParty {
         if (status != Status.Draft && status != Status.Active) revert NotDraftOrActive();
-        if (hasVotedTerminate[msg.sender]) revert AlreadyVoted();
 
-        hasVotedTerminate[msg.sender] = true;
-        emit TerminationRequested(msg.sender, reasonCID);
-
-        if (hasVotedTerminate[partyA] && hasVotedTerminate[partyB]) {
-            status = Status.Terminated;
-            emit Terminated(reasonCID);
-        }
+        status = Status.Terminated;
+        terminatedBy = msg.sender;
+        emit Terminated(msg.sender, reasonCID);
     }
 
     // ─── SUPERSEDING (AMENDMENTS) ─────────────────────────────────────────

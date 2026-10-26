@@ -13,7 +13,6 @@ require("dotenv").config();
  *   3. XAOTicketV2    (implementation, cloned per show)
  *   4. EntryValidator (implementation, cloned per show)
  *   5. ShowFactory
- *   6. SupportSlotAgreement (implementation, cloned per opener) and its factory
  *
  * Needs the GraphRegistry first. Its address is read from
  * deployments/<network>-graph.json (written by scripts/deployGraph.js), or
@@ -116,9 +115,6 @@ async function main() {
   ];
   const showFactory = await deploy("ShowFactory", factoryArgs);
 
-  const supportSlotImpl    = await deploy("SupportSlotAgreement");
-  const supportSlotFactory = await deploy("SupportSlotFactory", [supportSlotImpl]);
-
   const info = {
     network,
     chainId,
@@ -133,8 +129,6 @@ async function main() {
     eventEscrowImplementation: eventEscrowImpl,
     ticketImplementation: ticketImpl,
     entryValidatorImplementation: validatorImpl,
-    supportSlotImplementation: supportSlotImpl,
-    supportSlotFactory,
   };
 
   if (isLocal) {
@@ -158,9 +152,7 @@ async function main() {
   for (const impl of [showInstanceImpl, eventEscrowImpl, ticketImpl, validatorImpl]) {
     console.log(`  npx hardhat verify --network ${network} ${impl}`);
   }
-  console.log(`  npx hardhat verify --network ${network} ${showFactory} ${factoryArgs.join(" ")}`);
-  console.log(`  npx hardhat verify --network ${network} ${supportSlotImpl}`);
-  console.log(`  npx hardhat verify --network ${network} ${supportSlotFactory} ${supportSlotImpl}\n`);
+  console.log(`  npx hardhat verify --network ${network} ${showFactory} ${factoryArgs.join(" ")}\n`);
 
   return info;
 }

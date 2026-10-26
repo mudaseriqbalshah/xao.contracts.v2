@@ -49,18 +49,27 @@ contract EventEscrow is ReentrancyGuard {
     error NothingToClaim();
     error NothingToDistribute();
     error TransferFailed();
-    error NotASubordinate();
-    error ReservationsVoid();
-    error InsufficientReservation();
-    error InsufficientFundsToReserve();
-    error ZeroRecipient();
+    error SweepBeforeShowEnd();
+    error SweepBeforePayouts();
+    error NotOrganizer();
+    error AlreadyLinked();
+    error TooManyLinked();
+    error NotAnAgreementEscrow();
+    error AgreementMismatch();
+    error HasParent();
+    error HasLinkedAgreements();
+    error ParentAlreadySet();
+    error EarmarksVoid();
+    error InsufficientEarmark();
+    error NoParent();
+    error ParentNotEnded();
 
     // ─── ENUMS ────────────────────────────────────────────────────────────
     enum EscrowStatus { Active, Refunding, Completed, Expired }
 
     enum PayoutKind { FixedAmount, PercentageOfCurrentBalance }
 
-    enum CancelReason { Manual, MissedFunding }
+    enum CancelReason { Manual, MissedFunding, ParentEnded }
 
     /// @dev Interim dispute outcomes, used until the ArbitrationAgent exists.
     enum Resolution { None, Resume, ReleaseToPartyA, ReleaseToPartyB }
@@ -118,6 +127,13 @@ contract EventEscrow is ReentrancyGuard {
 
     uint256 public constant MAX_BATCH = 200;
 
+    /// @notice Most opener agreements one show can have.
+    uint256 public constant MAX_LINKED = 20;
+
+    // ShowInstance.ShowStatus values this contract reacts to.
+    uint8 private constant SHOW_CANCELLED = 5;
+    uint8 private constant SHOW_EXPIRED   = 6;
+
     /// @notice A dispute nobody settles ends with no breach after this long.
     ///         A stop-gap until the ArbitrationAgent exists.
     uint256 public constant DISPUTE_TIMEOUT = 30 days;
@@ -148,15 +164,24 @@ contract EventEscrow is ReentrancyGuard {
     mapping(address => uint256) public unclaimed;
     uint256 public unclaimedTotal;
 
-    /// @notice Money earmarked for subordinate agreements such as support slots.
-    ///         It stays in the escrow but is not available to payouts, the final
-    ///         sweep or refunds. If the show is cancelled the earmarks are
-    ///         void, so ticket buyers are refunded first as always.
-    mapping(address => uint256) public reservedFor;
-    uint256 public totalReserved;
-    bool public reservationsVoid;
-    mapping(address => uint256) public reservationNonce;
-    mapping(bytes32 => mapping(address => bool)) public reservationApproved;
+    // ─── LINKED AGREEMENTS (openers) ─────────────────────────────────────
+    // An opener has its own agreement, an EventEscrow of its own, linked here
+    // by the organizer. Ticket money pays every guarantee: once this escrow's
+    // own fixed payouts are covered, what is left is earmarked for the linked
+    // agreements in the order they were added, until each one's guarantee is
+    // funded. Whatever is left after that goes by the sweep rule. Earmarked
+    // money stays here, out of reach of payouts, the sweep and refunds, until
+    // the linked agreement collects it. If this show is cancelled the earmarks
+    // are void, so ticket buyers are refunded first as always.
+    address[] internal linkedAgreements;
+    mapping(address => bool) internal _isLinked;
+    mapping(address => uint256) internal _earmarked;
+    uint256 public totalEarmarked;
+    bool public earmarksVoid;
+    uint256 internal _releasedToLinked;
+
+    /// @notice Set on an opener's escrow: the main show escrow it is linked to.
+    address public parentEscrow;
 
     // Refunds
     uint16  public defaultCancelRefundBps;
@@ -198,11 +223,12 @@ contract EventEscrow is ReentrancyGuard {
     event Claimed(address indexed recipient, uint256 amount);
     event LateFundsDistributed(uint256 amount);
 
-    event ReservationApproved(address indexed subordinate, uint256 amount, address indexed by);
-    event ReservationApprovalRevoked(address indexed subordinate, uint256 amount, address indexed by);
-    event Reserved(address indexed subordinate, uint256 amount);
-    event SubordinateSettled(address indexed subordinate, address indexed recipient, uint256 amount);
-    event ReservationReleased(address indexed subordinate, uint256 amount);
+    event AgreementLinked(address indexed agreement);
+    event AttachedToParent(address indexed parent);
+    event Earmarked(address indexed agreement, uint256 amount);
+    event EarmarkSettled(address indexed agreement, uint256 amount);
+    event EarmarkReleased(address indexed agreement, uint256 amount);
+    event FundedFromParent(uint256 amount);
 
     // ─── MODIFIERS ────────────────────────────────────────────────────────
     modifier onlyParty() {
@@ -275,6 +301,10 @@ contract EventEscrow is ReentrancyGuard {
             sweepRule.bps.push(init.sweep.bps[i]);
         }
         if (sum != 10_000) revert InvalidSweepRule();
+        // The contract closes by itself at the show's end time, so the final
+        // payout cannot be due before it, or before any scheduled payout.
+        if (init.sweep.notBefore < IShowInstanceLike(init.show).showEndTime()) revert SweepBeforeShowEnd();
+        if (last > init.sweep.notBefore) revert SweepBeforePayouts();
         sweepRule.notBefore = init.sweep.notBefore;
 
         // Cancel rules are time windows in ascending order; the last one must
@@ -332,7 +362,14 @@ contract EventEscrow is ReentrancyGuard {
     ///         A fixed payout that cannot be covered yet is skipped, not failed.
     function executeAvailablePayouts() external nonReentrant whenActive notFrozen {
         if (!show.isFinalized()) revert NotFinalized();
+        _pullFromParent();
+        _allocate();
+        _executeDuePayouts();
+    }
 
+    /// @dev Pays every payout rule that is due. A fixed payout that cannot be
+    ///      covered yet is skipped, not failed.
+    function _executeDuePayouts() internal {
         uint256 len = payoutRules.length;
         for (uint256 i = 0; i < len; i++) {
             PayoutRule storage rule = payoutRules[i];
@@ -366,6 +403,11 @@ contract EventEscrow is ReentrancyGuard {
     function executeFinalSweep() external nonReentrant whenActive notFrozen {
         if (!show.isFinalized()) revert NotFinalized();
         if (block.timestamp < sweepRule.notBefore) revert SweepNotDue();
+        _pullFromParent();
+        _allocate();
+        // Payouts that are due go out first. Otherwise the sweep, which anyone
+        // can call, would hand everything to its recipients and skip them.
+        _executeDuePayouts();
 
         sweepExecuted = true;
         status = EscrowStatus.Completed;
@@ -388,10 +430,24 @@ contract EventEscrow is ReentrancyGuard {
     }
 
     /// @notice Anyone can cancel a show whose funding milestone was missed.
+    ///         Money earmarked for an opener's agreement by its parent counts as
+    ///         funded, and money this show earmarked for its openers does not.
     function cancelForMissedFunding(uint256 milestoneIndex) external whenActive notFrozen {
         FundingMilestone storage m = fundingMilestones[milestoneIndex];
-        if (block.timestamp <= m.byTime || totalFunded >= m.minFunded) revert MilestoneNotMissed();
+        if (block.timestamp <= m.byTime) revert MilestoneNotMissed();
+        _refreshFromParent();
+        if (_fundedForMilestones() >= m.minFunded) revert MilestoneNotMissed();
         _startRefunding(CancelReason.MissedFunding);
+    }
+
+    /// @notice Anyone can cancel an opener's agreement once the main show it is
+    ///         linked to has been cancelled or has expired.
+    function cancelIfParentEnded() external whenActive notFrozen {
+        address parent = parentEscrow;
+        if (parent == address(0)) revert NoParent();
+        uint8 parentStatus = IShowInstanceLike(IAgreementEscrowLike(parent).show()).status();
+        if (parentStatus != SHOW_CANCELLED && parentStatus != SHOW_EXPIRED) revert ParentNotEnded();
+        _startRefunding(CancelReason.ParentEnded);
     }
 
     /// @notice Refund the next batch of tickets to whoever holds them now.
@@ -544,72 +600,84 @@ contract EventEscrow is ReentrancyGuard {
         emit LateFundsDistributed(amount);
     }
 
-    // ─── SUBORDINATE AGREEMENTS (support slots) ───────────────────────────
+    // ─── LINKED AGREEMENTS (openers) ──────────────────────────────────────
 
-    /// @notice Earmark `amount` for a subordinate agreement of this show. Every
-    ///         party of the show must approve the same subordinate and amount,
-    ///         so no single party can pull money out of a shared escrow.
-    function reserveForSubordinate(address subordinate, uint256 amount)
-        external
-        nonReentrant
-        onlyParty
-        whenActive
-        notFrozen
-    {
-        if (!show.isFinalized()) revert NotFinalized();
-        if (amount == 0) revert ZeroAmount();
+    /// @notice The organizer links an opener's agreement to this show, so ticket
+    ///         money helps pay its guarantee. The opener joins at the end of the
+    ///         order, so it can never take money this show's own guarantees need.
+    function linkAgreement(address agreement) external nonReentrant whenActive notFrozen {
+        if (msg.sender != partyA) revert NotOrganizer();
+        if (parentEscrow != address(0)) revert HasParent();
+        if (agreement == address(this) || _isLinked[agreement]) revert AlreadyLinked();
+        if (linkedAgreements.length >= MAX_LINKED) revert TooManyLinked();
+        if (!IShowFactoryLike(factory).isEscrow(agreement)) revert NotAnAgreementEscrow();
 
-        ISubordinateLike sub = ISubordinateLike(subordinate);
-        if (sub.parentEscrow() != address(this) || sub.parentShow() != address(show)) {
-            revert NotASubordinate();
+        IAgreementEscrowLike linked = IAgreementEscrowLike(agreement);
+        if (linked.partyA() != partyA || linked.payoutToken() != address(payoutToken)) {
+            revert AgreementMismatch();
         }
 
-        bytes32 key = keccak256(abi.encode(subordinate, amount, reservationNonce[subordinate]));
-        reservationApproved[key][msg.sender] = true;
-        emit ReservationApproved(subordinate, amount, msg.sender);
-
-        if (!reservationApproved[key][partyA]) return;
-        if (partyB != address(0) && !reservationApproved[key][partyB]) return;
-
-        if (amount > distributable()) revert InsufficientFundsToReserve();
-        reservationNonce[subordinate]++;
-        reservedFor[subordinate] += amount;
-        totalReserved += amount;
-
-        sub.onReserved(amount);
-        emit Reserved(subordinate, amount);
+        _isLinked[agreement] = true;
+        linkedAgreements.push(agreement);
+        linked.attachToParent();
+        emit AgreementLinked(agreement);
     }
 
-    /// @notice Take back an approval given with reserveForSubordinate, as long
-    ///         as the other party has not completed the reservation yet.
-    function revokeReservationApproval(address subordinate, uint256 amount) external onlyParty {
-        bytes32 key = keccak256(abi.encode(subordinate, amount, reservationNonce[subordinate]));
-        reservationApproved[key][msg.sender] = false;
-        emit ReservationApprovalRevoked(subordinate, amount, msg.sender);
+    /// @notice Called by the main show's escrow when it links this one. Both
+    ///         must come from the same factory and share an organizer and token.
+    function attachToParent() external {
+        if (parentEscrow != address(0)) revert ParentAlreadySet();
+        if (linkedAgreements.length != 0) revert HasLinkedAgreements();
+        if (status != EscrowStatus.Active) revert NotActive();
+        if (!IShowFactoryLike(factory).isEscrow(msg.sender)) revert NotAnAgreementEscrow();
+
+        IAgreementEscrowLike parent = IAgreementEscrowLike(msg.sender);
+        if (parent.partyA() != partyA || parent.payoutToken() != address(payoutToken)) {
+            revert AgreementMismatch();
+        }
+
+        parentEscrow = msg.sender;
+        emit AttachedToParent(msg.sender);
     }
 
-    /// @notice A subordinate agreement collects money earmarked for it and sends
-    ///         it to `recipient`. Not blocked by a dispute on the parent show.
-    function settleSubordinate(address recipient, uint256 amount) external nonReentrant {
-        if (reservationsVoid) revert ReservationsVoid();
-        if (recipient == address(0)) revert ZeroRecipient();
-        if (amount == 0 || reservedFor[msg.sender] < amount) revert InsufficientReservation();
-
-        reservedFor[msg.sender] -= amount;
-        totalReserved -= amount;
-        _pay(recipient, amount);
-        emit SubordinateSettled(msg.sender, recipient, amount);
+    /// @notice Earmark ticket money for the linked agreements. Anyone may call.
+    ///         This escrow's own unpaid fixed payouts are covered first; what
+    ///         is left goes to the linked agreements in the order they were
+    ///         added, up to what each one still needs.
+    function allocate() external nonReentrant {
+        _allocate();
     }
 
-    /// @notice A subordinate agreement gives back money earmarked for it; the
-    ///         escrow can use it again. Does nothing once earmarks are void.
-    function releaseReservation(uint256 amount) external nonReentrant {
-        if (reservationsVoid) return;
-        if (amount == 0 || reservedFor[msg.sender] < amount) revert InsufficientReservation();
+    /// @notice An opener's escrow collects the money its parent earmarked for it.
+    ///         Anyone may call.
+    function pullFromParent() external nonReentrant {
+        _pullFromParent();
+    }
 
-        reservedFor[msg.sender] -= amount;
-        totalReserved -= amount;
-        emit ReservationReleased(msg.sender, amount);
+    /// @notice A linked agreement collects money earmarked for it. The money is
+    ///         sent to the agreement's escrow, which counts it as funded. Not
+    ///         blocked by a dispute on this show.
+    function settleLinked(uint256 amount) external nonReentrant {
+        if (earmarksVoid) revert EarmarksVoid();
+        if (amount == 0 || _earmarked[msg.sender] < amount) revert InsufficientEarmark();
+
+        _earmarked[msg.sender] -= amount;
+        totalEarmarked -= amount;
+        _releasedToLinked += amount;
+        if (!_tryTransfer(msg.sender, amount)) revert TransferFailed();
+        emit EarmarkSettled(msg.sender, amount);
+    }
+
+    /// @notice A linked agreement gives back what was earmarked for it, for
+    ///         example when it is cancelled. Does nothing once earmarks are void.
+    function releaseEarmark() external nonReentrant {
+        if (earmarksVoid) return;
+        uint256 amount = _earmarked[msg.sender];
+        if (amount == 0) return;
+
+        _earmarked[msg.sender] = 0;
+        totalEarmarked -= amount;
+        emit EarmarkReleased(msg.sender, amount);
     }
 
     // ─── VIEWS ────────────────────────────────────────────────────────────
@@ -619,6 +687,35 @@ contract EventEscrow is ReentrancyGuard {
         return activeCaseId == bytes32(0) ? 0 : uint256(disputeOpenedAt) + DISPUTE_TIMEOUT;
     }
 
+    function getLinkedAgreements() external view returns (address[] memory) {
+        return linkedAgreements;
+    }
+
+    /// @notice Earmarked ticket money `child` can collect now; zero if void.
+    function earmarkOf(address child) external view returns (uint256) {
+        return earmarksVoid ? 0 : _earmarked[child];
+    }
+
+    /// @notice What this agreement's guarantee needs in total: its largest
+    ///         funding milestone, or its fixed payouts if they are more.
+    function requiredFunding() public view returns (uint256 required) {
+        uint256 len = fundingMilestones.length;
+        for (uint256 i = 0; i < len; i++) {
+            if (fundingMilestones[i].minFunded > required) required = fundingMilestones[i].minFunded;
+        }
+        uint256 fixedSum = _fixedPayouts(false);
+        if (fixedSum > required) required = fixedSum;
+    }
+
+    /// @notice How much more funding this agreement needs, counting what its
+    ///         parent has earmarked for it. Zero once it is no longer Active.
+    function fundingNeed() public view returns (uint256) {
+        if (status != EscrowStatus.Active) return 0;
+        uint256 have = totalFunded + _pendingFromParent();
+        uint256 need = requiredFunding();
+        return need > have ? need - have : 0;
+    }
+
     function escrowBalance() public view returns (uint256) {
         return payoutToken.balanceOf(address(this));
     }
@@ -626,7 +723,7 @@ contract EventEscrow is ReentrancyGuard {
     /// @notice Balance not already owed to XAO or to a held payment.
     function distributable() public view returns (uint256) {
         uint256 balance  = escrowBalance();
-        uint256 reserved = protocolFeeAccrued + unclaimedTotal + (reservationsVoid ? 0 : totalReserved);
+        uint256 reserved = protocolFeeAccrued + unclaimedTotal + (earmarksVoid ? 0 : totalEarmarked);
         return balance > reserved ? balance - reserved : 0;
     }
 
@@ -650,7 +747,7 @@ contract EventEscrow is ReentrancyGuard {
 
     function _startRefunding(CancelReason reason) internal {
         status       = EscrowStatus.Refunding;
-        reservationsVoid = true;
+        earmarksVoid = true;
         cancelledAt  = uint64(block.timestamp);
         refundBps    = defaultCancelRefundBps;
         refundCursor = 1;
@@ -658,8 +755,81 @@ contract EventEscrow is ReentrancyGuard {
             ? 0
             : IShowTicketLike(ticketContract).lastMintedId();
 
+        // An opener's agreement hands back what its parent had earmarked for it.
+        if (parentEscrow != address(0)) {
+            try IAgreementEscrowLike(parentEscrow).releaseEarmark() {} catch {}
+        }
+
         show.onCancelled();
         emit RefundingStarted(reason, refundBps, maxRefundTokenId);
+    }
+
+    function _allocate() internal {
+        if (status != EscrowStatus.Active || earmarksVoid) return;
+        uint256 n = linkedAgreements.length;
+        if (n == 0 || show.isFrozen() || !show.isFinalized()) return;
+
+        uint256 free = distributable();
+        // Fixed payouts not yet paid: linked agreements never take money these need.
+        uint256 senior = _fixedPayouts(true);
+        if (free <= senior) return;
+        free -= senior;
+
+        for (uint256 i = 0; i < n && free > 0; i++) {
+            address agreement = linkedAgreements[i];
+            uint256 need = IAgreementEscrowLike(agreement).fundingNeed();
+            if (need == 0) continue;
+
+            uint256 give = need < free ? need : free;
+            _earmarked[agreement] += give;
+            totalEarmarked += give;
+            free -= give;
+            emit Earmarked(agreement, give);
+        }
+    }
+
+    function _pullFromParent() internal {
+        address parent = parentEscrow;
+        if (parent == address(0) || status != EscrowStatus.Active) return;
+
+        _refreshFromParent();
+        uint256 amount = IAgreementEscrowLike(parent).earmarkOf(address(this));
+        if (amount == 0) return;
+
+        try IAgreementEscrowLike(parent).settleLinked(amount) {
+            totalFunded += amount;
+            emit FundedFromParent(amount);
+        } catch {}
+    }
+
+    /// @dev The sum of fixed payout rules, or only of those not yet paid.
+    function _fixedPayouts(bool unexecutedOnly) internal view returns (uint256 sum) {
+        uint256 len = payoutRules.length;
+        for (uint256 i = 0; i < len; i++) {
+            PayoutRule storage rule = payoutRules[i];
+            if (rule.kind == PayoutKind.FixedAmount && !(unexecutedOnly && rule.executed)) sum += rule.value;
+        }
+    }
+
+    function _refreshFromParent() internal {
+        address parent = parentEscrow;
+        if (parent == address(0)) return;
+        try IAgreementEscrowLike(parent).allocate() {} catch {}
+    }
+
+    function _pendingFromParent() internal view returns (uint256) {
+        address parent = parentEscrow;
+        if (parent == address(0)) return 0;
+        return IAgreementEscrowLike(parent).earmarkOf(address(this));
+    }
+
+    /// @dev Money that is this agreement's own: everything paid in, less what
+    ///      it earmarked for or handed to its openers, plus what its parent
+    ///      has earmarked for it.
+    function _fundedForMilestones() internal view returns (uint256) {
+        uint256 outflow = (earmarksVoid ? 0 : totalEarmarked) + _releasedToLinked;
+        uint256 own = totalFunded > outflow ? totalFunded - outflow : 0;
+        return own + _pendingFromParent();
     }
 
     function _cancelRuleIndexAt(uint64 time) internal view returns (uint256) {

@@ -784,6 +784,41 @@ describe("Show bundle", function () {
       expect((await b.escrow.getPayoutRules())[0].executed).to.equal(false);
     });
 
+    it("pays the payouts that are due before the final sweep, so the sweep cannot skip them", async function () {
+      // Everything left after the sweep goes to the promoter. If the sweep ran
+      // first it would take the artist's guarantee too.
+      const skip = showConfig(promoter, artist, t0, {
+        funding: [], anchors: { termsHash: ethers.id("skip-test") },
+        sweep: { recipients: [promoter.address], bps: [10_000], notBefore: cfg.dates.showEndTime },
+      });
+      const b = await createShow(factory, promoter, skip);
+      await b.show.connect(promoter).signTerms();
+      await b.show.connect(artist).signTerms();
+      await usdc.mint(promoter.address, USDC(1_000));
+      await usdc.connect(promoter).approve(b.escrow.target, USDC(1_000));
+      await b.escrow.connect(promoter).deposit(USDC(1_000));
+
+      await time.increaseTo(cfg.dates.showEndTime);
+      await b.escrow.connect(stranger).executeFinalSweep();   // nobody paid out first
+
+      expect(await usdc.balanceOf(artist.address)).to.equal(USDC(500));      // the guarantee
+      expect(await usdc.balanceOf(promoter.address)).to.equal(USDC(500));    // what was left
+      expect(await usdc.balanceOf(b.escrow.target)).to.equal(0);
+    });
+
+    it("rejects a final payout due before the show ends or before a scheduled payout", async function () {
+      const end = cfg.dates.showEndTime;
+      const bad = (overrides, id) => ({ ...showConfig(promoter, artist, t0, overrides), showId: ethers.id(id) });
+
+      await expect(factory.connect(promoter).createShow(bad({
+        sweep: { recipients: [promoter.address], bps: [10_000], notBefore: end - 1 },
+      }, "early-sweep"))).to.be.revertedWithCustomError(escrowImpl, "SweepBeforeShowEnd");
+
+      await expect(factory.connect(promoter).createShow(bad({
+        payoutRules: [{ to: artist.address, kind: PayoutKind.FixedAmount, value: 1, notBefore: end + 1, isGuarantee: false }],
+      }, "late-payout"))).to.be.revertedWithCustomError(escrowImpl, "SweepBeforePayouts");
+    });
+
     it("does not pay out on an unsigned show", async function () {
       await expect(escrow.connect(stranger).executeAvailablePayouts())
         .to.be.revertedWithCustomError(escrow, "NotFinalized");

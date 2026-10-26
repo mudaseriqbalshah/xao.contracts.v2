@@ -6,21 +6,33 @@ require("dotenv").config();
 const PRIVATE_KEY = process.env.PRIVATE_KEY || "0x0000000000000000000000000000000000000000000000000000000000000000";
 const BASE_RPC = process.env.BASE_RPC || "https://mainnet.base.org";
 
-module.exports = {
-  solidity: {
-    version: "0.8.20",
-    settings: {
-      optimizer: {
-      enabled: true,
-      runs: 80,
-      details: {
-        yul: true,
-        yulDetails: {
-          optimizerSteps: "u",
-        },
+const settingsWithRuns = (runs) => ({
+  optimizer: {
+    enabled: true,
+    runs,
+    details: {
+      yul: true,
+      yulDetails: {
+        optimizerSteps: "u",
       },
     },
-    viaIR: true, 
+  },
+  viaIR: true,
+});
+
+module.exports = {
+  solidity: {
+    compilers: [{ version: "0.8.20", settings: settingsWithRuns(80) }],
+    overrides: {
+      // The global settings above only run the optimizer's unused-code pruner
+      // (optimizerSteps "u"). EventEscrow carries the payout, refund, dispute and
+      // opener logic and does not fit the 24,576-byte contract limit that way, so
+      // it uses the optimizer's default steps, tuned for size. It is called a few
+      // times per show, so cheaper calls matter less than fitting.
+      "contracts/show/EventEscrow.sol": {
+        version: "0.8.20",
+        settings: { optimizer: { enabled: true, runs: 1 }, viaIR: true },
+      },
     },
   },
   networks: {

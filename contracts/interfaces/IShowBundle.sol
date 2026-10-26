@@ -28,21 +28,28 @@ interface IEventEscrowLike {
     /// @notice Called by the ticket contract after it has transferred
     ///         `escrowed` to the escrow; `protocolFee` of that is held for XAO.
     function creditTicketSale(uint256 escrowed, uint256 protocolFee) external;
-
-    function payoutToken() external view returns (address);
-
-    /// @notice A subordinate agreement collects money earmarked for it.
-    function settleSubordinate(address recipient, uint256 amount) external;
-
-    /// @notice A subordinate agreement gives back money earmarked for it.
-    function releaseReservation(uint256 amount) external;
 }
 
-/// @notice What the escrow needs from a subordinate agreement, such as a support slot.
-interface ISubordinateLike {
-    function parentShow() external view returns (address);
-    function parentEscrow() external view returns (address);
-    function onReserved(uint256 amount) external;
+/// @notice What a main show escrow and an opener's escrow need from each other.
+interface IAgreementEscrowLike {
+    function partyA() external view returns (address);
+    function payoutToken() external view returns (address);
+    function show() external view returns (address);
+
+    /// @notice How much more funding this agreement needs to cover its guarantee.
+    function fundingNeed() external view returns (uint256);
+    /// @notice Ticket money the parent has earmarked for `child`; zero if void.
+    function earmarkOf(address child) external view returns (uint256);
+
+    function allocate() external;
+    function settleLinked(uint256 amount) external;
+    function releaseEarmark() external;
+    function attachToParent() external;
+}
+
+interface IShowFactoryLike {
+    /// @notice True for every EventEscrow the factory has deployed.
+    function isEscrow(address account) external view returns (bool);
 }
 
 interface IShowTicketLike {

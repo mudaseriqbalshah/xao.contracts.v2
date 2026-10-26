@@ -70,6 +70,10 @@ contract ShowFactory is Ownable {
     mapping(address => address[]) public userShows;
     mapping(bytes32 => address)   public showById;
 
+    /// @notice True for every EventEscrow this factory deployed. Escrows use it
+    ///         to check that an opener's agreement they are asked to link is real.
+    mapping(address => bool) public isEscrow;
+
     event ShowCreated(
         bytes32 indexed showId,
         address indexed showInstance,
@@ -155,6 +159,7 @@ contract ShowFactory is Ownable {
             })
         );
         ShowInstance(bundle.showInstance).setEscrowModule(bundle.escrow);
+        isEscrow[bundle.escrow] = true;
 
         // 3. Tickets + entry validator
         if (cfg.tickets.ticketsEnabled) {

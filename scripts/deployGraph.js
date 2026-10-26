@@ -5,13 +5,18 @@ const path = require("path");
 require("dotenv").config();
 
 /**
- * XAO Phase 2A Deployment Script — GraphRegistry + Tour contracts
+ * XAO Phase 2A Deployment Script — GraphRegistry, tours, standing agreements, staking containers
  *
  * Deploys, in order:
  *   1. GraphRegistry
  *   2. TourParticipationAgreement (implementation, cloned per TPA)
  *   3. TourShell (implementation, cloned per tour)
  *   4. TourFactory
+ *   5. StandingAgreement (implementation, cloned per agreement) and its factory
+ *   6. StakingParent (implementation, cloned per container) and its factory
+ *
+ * The GraphRegistry has no admin and cannot be changed after it is deployed,
+ * so deploy it only once every edge type and rule it needs is settled.
  *
  * Usage:
  *   Deploy to Base Sepolia (testnet):
@@ -58,7 +63,7 @@ async function main() {
   const [deployer] = await hre.ethers.getSigners();
   const balance = await hre.ethers.provider.getBalance(deployer.address);
 
-  console.log("\n═══ XAO Phase 2A: GraphRegistry + Tour contracts ═══\n");
+  console.log("\n═══ XAO Phase 2A: GraphRegistry, tours, agreements, staking ═══\n");
   console.log(`Network:   ${network} (chain ${chainId})`);
   console.log(`Deployer:  ${deployer.address}`);
   console.log(`Balance:   ${hre.ethers.formatEther(balance)} ETH\n`);
@@ -67,6 +72,12 @@ async function main() {
   const tpaImpl   = await deploy("TourParticipationAgreement");
   const shellImpl = await deploy("TourShell");
   const factory   = await deploy("TourFactory", [shellImpl.address, tpaImpl.address, registry.address]);
+
+  const agreementImpl    = await deploy("StandingAgreement");
+  const agreementFactory = await deploy("StandingAgreementFactory", [agreementImpl.address]);
+
+  const stakingImpl    = await deploy("StakingParent");
+  const stakingFactory = await deploy("StakingParentFactory", [stakingImpl.address, registry.address]);
 
   const info = {
     network,
@@ -77,11 +88,19 @@ async function main() {
     tourParticipationAgreementImplementation: tpaImpl.address,
     tourShellImplementation: shellImpl.address,
     tourFactory: factory.address,
+    standingAgreementImplementation: agreementImpl.address,
+    standingAgreementFactory: agreementFactory.address,
+    stakingParentImplementation: stakingImpl.address,
+    stakingParentFactory: stakingFactory.address,
     txHashes: {
       graphRegistry: registry.txHash,
       tourParticipationAgreementImplementation: tpaImpl.txHash,
       tourShellImplementation: shellImpl.txHash,
       tourFactory: factory.txHash,
+      standingAgreementImplementation: agreementImpl.txHash,
+      standingAgreementFactory: agreementFactory.txHash,
+      stakingParentImplementation: stakingImpl.txHash,
+      stakingParentFactory: stakingFactory.txHash,
     },
   };
 
@@ -107,7 +126,13 @@ async function main() {
   console.log(`  npx hardhat verify --network ${network} ${tpaImpl.address}`);
   console.log(`  npx hardhat verify --network ${network} ${shellImpl.address}`);
   console.log(
-    `  npx hardhat verify --network ${network} ${factory.address} ${shellImpl.address} ${tpaImpl.address} ${registry.address}\n`
+    `  npx hardhat verify --network ${network} ${factory.address} ${shellImpl.address} ${tpaImpl.address} ${registry.address}`
+  );
+  console.log(`  npx hardhat verify --network ${network} ${agreementImpl.address}`);
+  console.log(`  npx hardhat verify --network ${network} ${agreementFactory.address} ${agreementImpl.address}`);
+  console.log(`  npx hardhat verify --network ${network} ${stakingImpl.address}`);
+  console.log(
+    `  npx hardhat verify --network ${network} ${stakingFactory.address} ${stakingImpl.address} ${registry.address}\n`
   );
 
   return info;

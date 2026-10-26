@@ -47,6 +47,11 @@ contract EventEscrow is ReentrancyGuard {
     error NothingToClaim();
     error NothingToDistribute();
     error TransferFailed();
+    error NotASubordinate();
+    error ReservationsVoid();
+    error InsufficientReservation();
+    error InsufficientFundsToReserve();
+    error ZeroRecipient();
 
     // ─── ENUMS ────────────────────────────────────────────────────────────
     enum EscrowStatus { Active, Refunding, Completed, Expired }
@@ -137,6 +142,16 @@ contract EventEscrow is ReentrancyGuard {
     mapping(address => uint256) public unclaimed;
     uint256 public unclaimedTotal;
 
+    /// @notice Money earmarked for subordinate agreements such as support slots.
+    ///         It stays in the escrow but is not available to payouts, the final
+    ///         sweep or refunds. If the show is cancelled the earmarks are
+    ///         void, so ticket buyers are refunded first as always.
+    mapping(address => uint256) public reservedFor;
+    uint256 public totalReserved;
+    bool public reservationsVoid;
+    mapping(address => uint256) public reservationNonce;
+    mapping(bytes32 => mapping(address => bool)) public reservationApproved;
+
     // Refunds
     uint16  public defaultCancelRefundBps;
     uint16  public refundBps;
@@ -174,6 +189,12 @@ contract EventEscrow is ReentrancyGuard {
     event PaymentHeld(address indexed recipient, uint256 amount);
     event Claimed(address indexed recipient, uint256 amount);
     event LateFundsDistributed(uint256 amount);
+
+    event ReservationApproved(address indexed subordinate, uint256 amount, address indexed by);
+    event ReservationApprovalRevoked(address indexed subordinate, uint256 amount, address indexed by);
+    event Reserved(address indexed subordinate, uint256 amount);
+    event SubordinateSettled(address indexed subordinate, address indexed recipient, uint256 amount);
+    event ReservationReleased(address indexed subordinate, uint256 amount);
 
     // ─── MODIFIERS ────────────────────────────────────────────────────────
     modifier onlyParty() {
@@ -495,6 +516,74 @@ contract EventEscrow is ReentrancyGuard {
         emit LateFundsDistributed(amount);
     }
 
+    // ─── SUBORDINATE AGREEMENTS (support slots) ───────────────────────────
+
+    /// @notice Earmark `amount` for a subordinate agreement of this show. Every
+    ///         party of the show must approve the same subordinate and amount,
+    ///         so no single party can pull money out of a shared escrow.
+    function reserveForSubordinate(address subordinate, uint256 amount)
+        external
+        nonReentrant
+        onlyParty
+        whenActive
+        notFrozen
+    {
+        if (!show.isFinalized()) revert NotFinalized();
+        if (amount == 0) revert ZeroAmount();
+
+        ISubordinateLike sub = ISubordinateLike(subordinate);
+        if (sub.parentEscrow() != address(this) || sub.parentShow() != address(show)) {
+            revert NotASubordinate();
+        }
+
+        bytes32 key = keccak256(abi.encode(subordinate, amount, reservationNonce[subordinate]));
+        reservationApproved[key][msg.sender] = true;
+        emit ReservationApproved(subordinate, amount, msg.sender);
+
+        if (!reservationApproved[key][partyA]) return;
+        if (partyB != address(0) && !reservationApproved[key][partyB]) return;
+
+        if (amount > distributable()) revert InsufficientFundsToReserve();
+        reservationNonce[subordinate]++;
+        reservedFor[subordinate] += amount;
+        totalReserved += amount;
+
+        sub.onReserved(amount);
+        emit Reserved(subordinate, amount);
+    }
+
+    /// @notice Take back an approval given with reserveForSubordinate, as long
+    ///         as the other party has not completed the reservation yet.
+    function revokeReservationApproval(address subordinate, uint256 amount) external onlyParty {
+        bytes32 key = keccak256(abi.encode(subordinate, amount, reservationNonce[subordinate]));
+        reservationApproved[key][msg.sender] = false;
+        emit ReservationApprovalRevoked(subordinate, amount, msg.sender);
+    }
+
+    /// @notice A subordinate agreement collects money earmarked for it and sends
+    ///         it to `recipient`. Not blocked by a dispute on the parent show.
+    function settleSubordinate(address recipient, uint256 amount) external nonReentrant {
+        if (reservationsVoid) revert ReservationsVoid();
+        if (recipient == address(0)) revert ZeroRecipient();
+        if (amount == 0 || reservedFor[msg.sender] < amount) revert InsufficientReservation();
+
+        reservedFor[msg.sender] -= amount;
+        totalReserved -= amount;
+        _pay(recipient, amount);
+        emit SubordinateSettled(msg.sender, recipient, amount);
+    }
+
+    /// @notice A subordinate agreement gives back money earmarked for it; the
+    ///         escrow can use it again. Does nothing once earmarks are void.
+    function releaseReservation(uint256 amount) external nonReentrant {
+        if (reservationsVoid) return;
+        if (amount == 0 || reservedFor[msg.sender] < amount) revert InsufficientReservation();
+
+        reservedFor[msg.sender] -= amount;
+        totalReserved -= amount;
+        emit ReservationReleased(msg.sender, amount);
+    }
+
     // ─── VIEWS ────────────────────────────────────────────────────────────
 
     function escrowBalance() public view returns (uint256) {
@@ -504,7 +593,7 @@ contract EventEscrow is ReentrancyGuard {
     /// @notice Balance not already owed to XAO or to a held payment.
     function distributable() public view returns (uint256) {
         uint256 balance  = escrowBalance();
-        uint256 reserved = protocolFeeAccrued + unclaimedTotal;
+        uint256 reserved = protocolFeeAccrued + unclaimedTotal + (reservationsVoid ? 0 : totalReserved);
         return balance > reserved ? balance - reserved : 0;
     }
 
@@ -528,6 +617,7 @@ contract EventEscrow is ReentrancyGuard {
 
     function _startRefunding(CancelReason reason) internal {
         status       = EscrowStatus.Refunding;
+        reservationsVoid = true;
         cancelledAt  = uint64(block.timestamp);
         refundBps    = defaultCancelRefundBps;
         refundCursor = 1;

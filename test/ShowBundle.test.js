@@ -1176,6 +1176,34 @@ describe("Show bundle", function () {
       expect(await show.status()).to.equal(ShowStatus.Completed);
     });
 
+    it("can be raised up to the show's end time and not after, even before the payout is closed", async function () {
+      await time.increaseTo(cfg.dates.showEndTime - 5);
+      await escrow.connect(promoter).raiseDispute();
+      expect(await show.isFrozen()).to.equal(true);
+      await escrow.connect(promoter).resolveDispute(Resolution.Resume);
+      await escrow.connect(artist).resolveDispute(Resolution.Resume);
+
+      await time.increaseTo(cfg.dates.showEndTime + 1);
+      expect(await escrow.status()).to.equal(EscrowStatus.Active);   // nobody has closed it
+      await expect(escrow.connect(promoter).raiseDispute())
+        .to.be.revertedWithCustomError(escrow, "DisputeWindowClosed");
+      await expect(escrow.connect(artist).raiseDispute())
+        .to.be.revertedWithCustomError(escrow, "DisputeWindowClosed");
+    });
+
+    it("keeps an open dispute running past the end time until it is settled or times out", async function () {
+      await time.increaseTo(cfg.dates.showEndTime - 5);
+      await escrow.connect(promoter).raiseDispute();
+      await time.increaseTo(cfg.dates.showEndTime + 1);
+      expect(await show.isFrozen()).to.equal(true);
+
+      await escrow.connect(promoter).resolveDispute(Resolution.Resume);
+      await escrow.connect(artist).resolveDispute(Resolution.Resume);
+      expect(await show.isFrozen()).to.equal(false);
+      await escrow.connect(stranger).executeFinalSweep();
+      expect(await escrow.status()).to.equal(EscrowStatus.Completed);
+    });
+
     it("cannot be raised once the contract is closed", async function () {
       await time.increaseTo(cfg.dates.showEndTime);
       await escrow.connect(stranger).executeFinalSweep();

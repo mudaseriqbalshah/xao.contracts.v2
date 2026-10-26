@@ -38,6 +38,7 @@ contract EventEscrow is ReentrancyGuard {
     error Frozen();
     error NotFrozen();
     error DisputeNotExpired();
+    error DisputeWindowClosed();
     error ShowAlreadyEnded();
     error MilestoneNotMissed();
     error InvalidBatchSize();
@@ -463,8 +464,12 @@ contract EventEscrow is ReentrancyGuard {
     // ─── DISPUTE (interim: resolved by the parties) ───────────────────────
 
     /// @notice Freeze the escrow. No deposits, payouts or cancellation while frozen.
+    ///         Only possible up to the show's end time.
     function raiseDispute() external onlyParty whenActive notFrozen {
         if (!show.isFinalized()) revert NotFinalized();
+        // The contract closes by itself at its end time, so a dispute has to be
+        // raised by then, even if nobody has called the final payout yet.
+        if (block.timestamp > show.showEndTime()) revert DisputeWindowClosed();
 
         bytes32 caseId = keccak256(abi.encodePacked(showId, ++disputeNonce));
         activeCaseId = caseId;

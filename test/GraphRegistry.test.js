@@ -157,9 +157,9 @@ describe("GraphRegistry", function () {
       await registry.connect(operator).registerEdge(show.target, module_.address, EdgeType.HAS_MODULE, ZERO_BYTES32, "");
     });
 
-    it("the endpoint address itself, but a module claim then waits for the show's parties", async function () {
-      const id = edgeIdOf(show.target, module_.address, EdgeType.HAS_MODULE);
-      await registry.connect(module_).registerEdge(show.target, module_.address, EdgeType.HAS_MODULE, ZERO_BYTES32, "");
+    it("the endpoint address itself, for an edge that needs the other side to confirm", async function () {
+      const id = edgeIdOf(show.target, module_.address, EdgeType.REFERENCES);
+      await registry.connect(module_).registerEdge(show.target, module_.address, EdgeType.REFERENCES, ZERO_BYTES32, "");
       expect(await registry.edgeStatus(id)).to.equal(EdgeStatus.Pending);
       expect(await registry.getRequiredConfirmersForEdge(id)).to.deep.equal([venue.address, artist.address]);
     });
@@ -177,7 +177,7 @@ describe("GraphRegistry", function () {
     });
   });
 
-  describe("Immediate edges are claims by the `from` node", function () {
+  describe("Immediate edges are claims by the `from` node, and only it can make them", function () {
     let show;
 
     beforeEach(async function () {
@@ -192,19 +192,36 @@ describe("GraphRegistry", function () {
 
     it("an outsider cannot register itself as the module or escrow of someone else's show", async function () {
       for (const type of [EdgeType.HAS_MODULE, EdgeType.FUNDS_HELD_BY]) {
-        const id = edgeIdOf(show.target, stranger.address, type);
-        await registry.connect(stranger).registerEdge(show.target, stranger.address, type, ZERO_BYTES32, "");
-        expect(await registry.edgeStatus(id)).to.equal(EdgeStatus.Pending);
-        expect(await registry.isEdgeActive(id)).to.equal(false);
+        await expect(
+          registry.connect(stranger).registerEdge(show.target, stranger.address, type, ZERO_BYTES32, "")
+        ).to.be.revertedWithCustomError(registry, "NotAuthorized");
       }
     });
 
-    it("the show's parties can still approve a module that registered itself", async function () {
-      const id = edgeIdOf(show.target, module_.address, EdgeType.HAS_MODULE);
-      await registry.connect(module_).registerEdge(show.target, module_.address, EdgeType.HAS_MODULE, ZERO_BYTES32, "");
-      await registry.connect(venue).confirmEdge(id);
-      await registry.connect(artist).confirmEdge(id);
-      expect(await registry.edgeStatus(id)).to.equal(EdgeStatus.Active);
+    it("a module cannot register itself either", async function () {
+      for (const type of [EdgeType.HAS_MODULE, EdgeType.FUNDS_HELD_BY]) {
+        await expect(
+          registry.connect(module_).registerEdge(show.target, module_.address, type, ZERO_BYTES32, "")
+        ).to.be.revertedWithCustomError(registry, "NotAuthorized");
+      }
+    });
+
+    it("leaves nothing behind on the show when an outsider tries", async function () {
+      await expect(
+        registry.connect(stranger).registerEdge(show.target, stranger.address, EdgeType.HAS_MODULE, ZERO_BYTES32, "")
+      ).to.be.reverted;
+      expect(await registry.edgesFromCount(show.target)).to.equal(0);
+      expect(await registry.edgesToCount(stranger.address)).to.equal(0);
+      expect(await registry.edgeStatus(edgeIdOf(show.target, stranger.address, EdgeType.HAS_MODULE)))
+        .to.equal(EdgeStatus.None);
+    });
+
+    it("either party of the show can register a module", async function () {
+      for (const [signer, meta] of [[venue, "v"], [artist, "a"]]) {
+        const id = edgeIdOf(show.target, module_.address, EdgeType.HAS_MODULE, ethers.id(meta));
+        await registry.connect(signer).registerEdge(show.target, module_.address, EdgeType.HAS_MODULE, ethers.id(meta), "");
+        expect(await registry.edgeStatus(id)).to.equal(EdgeStatus.Active);
+      }
     });
 
     it("a node's operator, such as a factory, registers its modules as Active", async function () {

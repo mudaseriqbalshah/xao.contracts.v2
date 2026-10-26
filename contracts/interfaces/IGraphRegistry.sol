@@ -26,9 +26,9 @@ interface IGraphRegistry {
     enum EdgeStatus { None, Pending, Active, Inactive }
 
     /// @dev How an edge type reaches Active.
-    ///      Immediate    — Active on registration when the registrar is
-    ///                     authorized on `from`, the node making the claim;
-    ///                     otherwise Pending until the parties of `from` confirm.
+    ///      Immediate    — Active on registration. Only `from`, the node making
+    ///                     the claim, its parties or its operator can register it;
+    ///                     anyone else is rejected.
     ///      Counterparty — Active on registration only if the registrar is
     ///                     authorized on both endpoints; otherwise Pending until
     ///                     the parties of the other endpoint confirm.

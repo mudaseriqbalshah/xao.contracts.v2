@@ -118,6 +118,13 @@ contract GraphRegistry is IGraphRegistry {
         bool authTo   = isAuthorizedFor(to, msg.sender);
         if (!authFrom && !authTo) revert NotAuthorized();
 
+        // Immediate edges (HAS_MODULE, FUNDS_HELD_BY) are claims made by `from`:
+        // "this show has that module". Only `from` itself, one of its parties or
+        // its operator can make them. Otherwise anyone could fill a show's list
+        // with modules of their own, and such entries are a way to phish.
+        ConfirmPolicy policy = confirmPolicy[edgeType];
+        if (policy == ConfirmPolicy.Immediate && !authFrom) revert NotAuthorized();
+
         edgeId = computeEdgeId(from, to, edgeType, metaHash);
         if (edgeStatus[edgeId] != EdgeStatus.None) revert EdgeExists();
 
@@ -125,17 +132,11 @@ contract GraphRegistry is IGraphRegistry {
         _edgesFrom[from].push(edgeId);
         _edgesTo[to].push(edgeId);
 
-        ConfirmPolicy policy = confirmPolicy[edgeType];
         uint8 sides;
         if (policy == ConfirmPolicy.AllParties) {
             sides = SIDE_FROM | SIDE_TO;
         } else if (policy == ConfirmPolicy.Counterparty) {
             sides = (authFrom ? 0 : SIDE_FROM) | (authTo ? 0 : SIDE_TO);
-        } else if (!authFrom) {
-            // Immediate edges are claims by `from` ("this show has that module").
-            // Being authorized only on `to` must not be enough, or anyone could
-            // register themselves as a module of someone else's show.
-            sides = SIDE_FROM;
         }
 
         if (sides == 0) {

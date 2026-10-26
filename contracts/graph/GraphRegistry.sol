@@ -55,7 +55,6 @@ contract GraphRegistry is IGraphRegistry {
     mapping(address => bytes32[]) private _edgesTo;
 
     constructor() {
-        // HAS_MODULE stays Immediate (the mapping default).
         confirmPolicy[EdgeType.CHILD_OF]      = ConfirmPolicy.Counterparty;
         confirmPolicy[EdgeType.PARENTS]       = ConfirmPolicy.Counterparty;
         confirmPolicy[EdgeType.UNDER_TOUR]    = ConfirmPolicy.Counterparty;
@@ -68,6 +67,12 @@ contract GraphRegistry is IGraphRegistry {
         confirmPolicy[EdgeType.PARTICIPATES_AS] = ConfirmPolicy.Counterparty;
         confirmPolicy[EdgeType.OWNED_BY]        = ConfirmPolicy.Counterparty;
         confirmPolicy[EdgeType.OPERATED_BY]     = ConfirmPolicy.Counterparty;
+        // These name or point at a node other than the one asserting them.
+        confirmPolicy[EdgeType.DERIVES_FROM]     = ConfirmPolicy.Counterparty;
+        confirmPolicy[EdgeType.REFERENCES]       = ConfirmPolicy.Counterparty;
+        confirmPolicy[EdgeType.PAYOUT_ROUTED_TO] = ConfirmPolicy.Counterparty;
+        confirmPolicy[EdgeType.DELEGATED_TO]     = ConfirmPolicy.Counterparty;
+        // HAS_MODULE and FUNDS_HELD_BY stay Immediate (the mapping default).
     }
 
     // ─── WRITES ───────────────────────────────────────────────────────────
@@ -126,6 +131,11 @@ contract GraphRegistry is IGraphRegistry {
             sides = SIDE_FROM | SIDE_TO;
         } else if (policy == ConfirmPolicy.Counterparty) {
             sides = (authFrom ? 0 : SIDE_FROM) | (authTo ? 0 : SIDE_TO);
+        } else if (!authFrom) {
+            // Immediate edges are claims by `from` ("this show has that module").
+            // Being authorized only on `to` must not be enough, or anyone could
+            // register themselves as a module of someone else's show.
+            sides = SIDE_FROM;
         }
 
         if (sides == 0) {

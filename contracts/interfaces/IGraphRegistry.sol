@@ -15,13 +15,20 @@ interface IGraphRegistry {
         REPLACES,       // reserved for replacement relationships
         PARTICIPATES_AS, // Org/User -> Instance; the role goes in the edge metadata
         OWNED_BY,       // Contract -> Org/Wallet that owns it
-        OPERATED_BY     // Contract -> User with operational authority
+        OPERATED_BY,    // Contract -> User with operational authority
+        DERIVES_FROM,   // Instance -> the standing agreement or template it was generated from
+        REFERENCES,     // Shortcut so a node can appear in another view without a second home
+        PAYOUT_ROUTED_TO, // Instance -> Org/Wallet that funds are routed to
+        FUNDS_HELD_BY,  // Instance -> the escrow that holds its funds
+        DELEGATED_TO    // Delegation or handoff of authority
     }
 
     enum EdgeStatus { None, Pending, Active, Inactive }
 
     /// @dev How an edge type reaches Active.
-    ///      Immediate    — Active on registration.
+    ///      Immediate    — Active on registration when the registrar is
+    ///                     authorized on `from`, the node making the claim;
+    ///                     otherwise Pending until the parties of `from` confirm.
     ///      Counterparty — Active on registration only if the registrar is
     ///                     authorized on both endpoints; otherwise Pending until
     ///                     the parties of the other endpoint confirm.

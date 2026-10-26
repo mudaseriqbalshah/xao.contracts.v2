@@ -12,6 +12,7 @@ const EdgeType = {
   HAS_MODULE: 0, CHILD_OF: 1, PARENTS: 2, APPLIES_TO: 3,
   SPONSORED_BY: 4, UNDER_TOUR: 5, UNDER_STAKING: 6, REPLACES: 7,
   PARTICIPATES_AS: 8, OWNED_BY: 9, OPERATED_BY: 10,
+  DERIVES_FROM: 11, REFERENCES: 12, PAYOUT_ROUTED_TO: 13, FUNDS_HELD_BY: 14, DELEGATED_TO: 15,
 };
 const EdgeStatus   = { None: 0, Pending: 1, Active: 2, Inactive: 3 };
 const ConfirmPolicy = { Immediate: 0, Counterparty: 1, AllParties: 2 };
@@ -63,6 +64,11 @@ describe("GraphRegistry", function () {
       expect(await registry.confirmPolicy(EdgeType.PARTICIPATES_AS)).to.equal(ConfirmPolicy.Counterparty);
       expect(await registry.confirmPolicy(EdgeType.OWNED_BY)).to.equal(ConfirmPolicy.Counterparty);
       expect(await registry.confirmPolicy(EdgeType.OPERATED_BY)).to.equal(ConfirmPolicy.Counterparty);
+      expect(await registry.confirmPolicy(EdgeType.DERIVES_FROM)).to.equal(ConfirmPolicy.Counterparty);
+      expect(await registry.confirmPolicy(EdgeType.REFERENCES)).to.equal(ConfirmPolicy.Counterparty);
+      expect(await registry.confirmPolicy(EdgeType.PAYOUT_ROUTED_TO)).to.equal(ConfirmPolicy.Counterparty);
+      expect(await registry.confirmPolicy(EdgeType.DELEGATED_TO)).to.equal(ConfirmPolicy.Counterparty);
+      expect(await registry.confirmPolicy(EdgeType.FUNDS_HELD_BY)).to.equal(ConfirmPolicy.Immediate);
     });
 
     it("reports which edge types need all parties to confirm", async function () {
@@ -151,8 +157,11 @@ describe("GraphRegistry", function () {
       await registry.connect(operator).registerEdge(show.target, module_.address, EdgeType.HAS_MODULE, ZERO_BYTES32, "");
     });
 
-    it("the endpoint address itself", async function () {
+    it("the endpoint address itself, but a module claim then waits for the show's parties", async function () {
+      const id = edgeIdOf(show.target, module_.address, EdgeType.HAS_MODULE);
       await registry.connect(module_).registerEdge(show.target, module_.address, EdgeType.HAS_MODULE, ZERO_BYTES32, "");
+      expect(await registry.edgeStatus(id)).to.equal(EdgeStatus.Pending);
+      expect(await registry.getRequiredConfirmersForEdge(id)).to.deep.equal([venue.address, artist.address]);
     });
 
     it("an operator of a party that is an org wallet", async function () {
@@ -165,6 +174,61 @@ describe("GraphRegistry", function () {
       await registry.connect(operator).registerEdge(orgShow.target, module_.address, EdgeType.HAS_MODULE, ZERO_BYTES32, "");
       expect(await registry.isAuthorizedFor(orgShow.target, operator.address)).to.equal(true);
       expect(await registry.isAuthorizedFor(orgShow.target, stranger.address)).to.equal(false);
+    });
+  });
+
+  describe("Immediate edges are claims by the `from` node", function () {
+    let show;
+
+    beforeEach(async function () {
+      show = await deployNode(venue.address, artist.address);
+    });
+
+    it("FUNDS_HELD_BY is Active at once when registered for the show", async function () {
+      const id = edgeIdOf(show.target, module_.address, EdgeType.FUNDS_HELD_BY);
+      await registry.connect(venue).registerEdge(show.target, module_.address, EdgeType.FUNDS_HELD_BY, ZERO_BYTES32, "");
+      expect(await registry.edgeStatus(id)).to.equal(EdgeStatus.Active);
+    });
+
+    it("an outsider cannot register itself as the module or escrow of someone else's show", async function () {
+      for (const type of [EdgeType.HAS_MODULE, EdgeType.FUNDS_HELD_BY]) {
+        const id = edgeIdOf(show.target, stranger.address, type);
+        await registry.connect(stranger).registerEdge(show.target, stranger.address, type, ZERO_BYTES32, "");
+        expect(await registry.edgeStatus(id)).to.equal(EdgeStatus.Pending);
+        expect(await registry.isEdgeActive(id)).to.equal(false);
+      }
+    });
+
+    it("the show's parties can still approve a module that registered itself", async function () {
+      const id = edgeIdOf(show.target, module_.address, EdgeType.HAS_MODULE);
+      await registry.connect(module_).registerEdge(show.target, module_.address, EdgeType.HAS_MODULE, ZERO_BYTES32, "");
+      await registry.connect(venue).confirmEdge(id);
+      await registry.connect(artist).confirmEdge(id);
+      expect(await registry.edgeStatus(id)).to.equal(EdgeStatus.Active);
+    });
+
+    it("a node's operator, such as a factory, registers its modules as Active", async function () {
+      await show.setOperator(operator.address, true);
+      const id = edgeIdOf(show.target, module_.address, EdgeType.HAS_MODULE);
+      await registry.connect(operator).registerEdge(show.target, module_.address, EdgeType.HAS_MODULE, ZERO_BYTES32, "");
+      expect(await registry.edgeStatus(id)).to.equal(EdgeStatus.Active);
+    });
+  });
+
+  describe("Other consent edges (DERIVES_FROM / REFERENCES / PAYOUT_ROUTED_TO / DELEGATED_TO)", function () {
+    it("each waits for the other endpoint's parties when registered from one side", async function () {
+      const standing = await deployNode(agent.address, band.address);
+      const show = await deployNode(venue.address, artist.address);
+      for (const type of [EdgeType.DERIVES_FROM, EdgeType.REFERENCES, EdgeType.PAYOUT_ROUTED_TO, EdgeType.DELEGATED_TO]) {
+        const id = edgeIdOf(show.target, standing.target, type);
+        await registry.connect(venue).registerEdge(show.target, standing.target, type, ZERO_BYTES32, "");
+        expect(await registry.edgeStatus(id)).to.equal(EdgeStatus.Pending);
+        expect(await registry.getRequiredConfirmersForEdge(id)).to.deep.equal([agent.address, band.address]);
+
+        await registry.connect(agent).confirmEdge(id);
+        await registry.connect(band).confirmEdge(id);
+        expect(await registry.edgeStatus(id)).to.equal(EdgeStatus.Active);
+      }
     });
   });
 

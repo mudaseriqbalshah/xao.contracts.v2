@@ -36,9 +36,9 @@ contract GraphRegistry is IGraphRegistry {
     uint8 private constant SIDE_FROM = 1;
     uint8 private constant SIDE_TO   = 2;
 
-    mapping(bytes32 => Edge)       public edges;
+    mapping(bytes32 => Edge)       public override edges;
     mapping(bytes32 => EdgeStatus) public override edgeStatus;
-    mapping(bytes32 => bytes32)    public supersededBy;          // old -> new
+    mapping(bytes32 => bytes32)    public override supersededBy; // old -> new
 
     mapping(bytes32 => mapping(address => bool)) public confirmedBy; // edgeId => confirmer => bool
     mapping(bytes32 => uint256)                  public confirmCount;

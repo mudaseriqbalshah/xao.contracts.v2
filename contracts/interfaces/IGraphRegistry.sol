@@ -72,6 +72,21 @@ interface IGraphRegistry {
 
     function isEdgeActive(bytes32 edgeId) external view returns (bool);
 
+    /// @notice The edge that replaced `edgeId`, or zero if it was not superseded.
+    function supersededBy(bytes32 edgeId) external view returns (bytes32);
+
+    function edges(bytes32 edgeId)
+        external
+        view
+        returns (
+            address from,
+            address to,
+            EdgeType edgeType,
+            bytes32 metaHash,
+            string memory metaCID,
+            uint64 createdAt
+        );
+
     function computeEdgeId(
         address from,
         address to,

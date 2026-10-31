@@ -91,6 +91,15 @@ function showConfig(promoter, artist, t0, overrides = {}) {
     ...overrides.dates,
   };
 
+  const sweep = overrides.sweep || {
+    recipients: artist ? [promoter.address, artist.address] : [promoter.address],
+    bps: artist ? [4_000, 6_000] : [10_000],
+    notBefore: dates.showEndTime,
+  };
+  const partyBShare = artist
+    ? sweep.recipients.reduce((sum, r, i) => (r === artist.address ? sum + (sweep.bps[i] || 0) : sum), 0)
+    : 0;
+
   return {
     showId: ZERO_BYTES32,
     partyA: { wallet: promoter.address, role: PartyRole.PROMOTER, xaoUsername: "promoter1" },
@@ -110,7 +119,7 @@ function showConfig(promoter, artist, t0, overrides = {}) {
     financials: {
       guaranteeUSDC: USDC(1_000),
       guaranteePctBPS: 0,
-      backendBPS: 2_000,
+      backendBPS: partyBShare,   // partyB's share of the sweep, as the factory requires
       barSplitBPS: 0,
       merchSplitBPS: 0,
       ...overrides.financials,
@@ -152,11 +161,7 @@ function showConfig(promoter, artist, t0, overrides = {}) {
         isGuarantee: true,
       },
     ],
-    sweep: overrides.sweep || {
-      recipients: artist ? [promoter.address, artist.address] : [promoter.address],
-      bps: artist ? [4_000, 6_000] : [10_000],
-      notBefore: dates.showEndTime,
-    },
+    sweep,
     cancelRules: overrides.cancelRules || [
       { notAfter: t0 + 20 * ONE_DAY, payBpsToPartyA: 10_000, payBpsToPartyB: 0, treasuryBps: 0 },
       { notAfter: MAX_UINT64, payBpsToPartyA: 5_000, payBpsToPartyB: 4_000, treasuryBps: 1_000 },

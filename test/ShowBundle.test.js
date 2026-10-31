@@ -128,6 +128,83 @@ describe("Show bundle", function () {
       expect(theirs.show.target).to.not.equal(mine.show.target);
     });
 
+    describe("backend", function () {
+      const sweep = (recipients, bps) => ({ recipients, bps, notBefore: 0 });   // notBefore is set below
+
+      function config(id, overrides) {
+        const c = { ...showConfig(promoter, artist, t0, overrides), showId: ethers.id(id) };
+        return c;
+      }
+
+      it("must equal partyB's share of the sweep", async function () {
+        const end = cfg.dates.showEndTime;
+
+        // The terms say 20% but the sweep pays the artist 60%.
+        await expect(factory.connect(promoter).createShow(config("b1", {
+          financials: { backendBPS: 2_000 },
+        }))).to.be.revertedWithCustomError(factory, "BackendMismatch");
+
+        // The terms say no backend but the sweep pays the artist something.
+        await expect(factory.connect(promoter).createShow(config("b2", {
+          financials: { backendBPS: 0 },
+        }))).to.be.revertedWithCustomError(factory, "BackendMismatch");
+
+        // The terms say 40% but the artist is not in the sweep at all.
+        await expect(factory.connect(promoter).createShow(config("b3", {
+          financials: { backendBPS: 4_000 },
+          sweep: { ...sweep([promoter.address], [10_000]), notBefore: end },
+        }))).to.be.revertedWithCustomError(factory, "BackendMismatch");
+
+        // Matching terms are accepted.
+        await factory.connect(promoter).createShow(config("b4", {
+          financials: { backendBPS: 6_000 },
+        }));
+      });
+
+      it("lets others take a cut of the sweep, and adds up every entry for partyB", async function () {
+        const end = cfg.dates.showEndTime;
+
+        // A promoter and a booking agent share the leftover; the artist gets 30%.
+        await factory.connect(promoter).createShow(config("b5", {
+          financials: { backendBPS: 3_000 },
+          sweep: { ...sweep([promoter.address, stranger.address, artist.address], [5_000, 2_000, 3_000]), notBefore: end },
+        }));
+
+        // partyB listed twice counts once its entries are added up.
+        await factory.connect(promoter).createShow(config("b6", {
+          financials: { backendBPS: 3_000 },
+          sweep: { ...sweep([artist.address, promoter.address, artist.address], [1_000, 7_000, 2_000]), notBefore: end },
+        }));
+
+        await expect(factory.connect(promoter).createShow(config("b7", {
+          financials: { backendBPS: 2_000 },
+          sweep: { ...sweep([artist.address, promoter.address, artist.address], [1_000, 7_000, 2_000]), notBefore: end },
+        }))).to.be.revertedWithCustomError(factory, "BackendMismatch");
+      });
+
+      it("is not checked for a show with no partyB", async function () {
+        const solo = showConfig(promoter, null, t0, { financials: { backendBPS: 5_000 } });
+        await factory.connect(promoter).createShow({ ...solo, showId: ethers.id("solo-backend") });
+      });
+
+      it("keeps an opener without a backend consistent with a sweep that pays only the organizer", async function () {
+        const opener = showConfig(promoter, fan1, t0, {
+          tickets: { ticketsEnabled: false },
+          sweep: { ...sweep([promoter.address], [10_000]), notBefore: cfg.dates.showEndTime },
+        });
+        expect(opener.financials.backendBPS).to.equal(0);
+        await factory.connect(promoter).createShow({ ...opener, showId: ethers.id("opener-no-backend") });
+
+        const claimsBackend = showConfig(promoter, fan1, t0, {
+          tickets: { ticketsEnabled: false },
+          financials: { backendBPS: 2_000 },
+          sweep: { ...sweep([promoter.address], [10_000]), notBefore: cfg.dates.showEndTime },
+        });
+        await expect(factory.connect(promoter).createShow({ ...claimsBackend, showId: ethers.id("opener-claims-backend") }))
+          .to.be.revertedWithCustomError(factory, "BackendMismatch");
+      });
+    });
+
     it("rejects arbitration until an agent is configured, and new shows while paused", async function () {
       const withArb = { ...showConfig(promoter, artist, t0), arbitrationEnabled: true, showId: ethers.id("arb") };
       await expect(factory.connect(promoter).createShow(withArb))
@@ -179,7 +256,7 @@ describe("Show bundle", function () {
 
       const fin = await show.financials();
       expect(fin.guaranteeUSDC).to.equal(USDC(1_000));
-      expect(fin.backendBPS).to.equal(2_000);
+      expect(fin.backendBPS).to.equal(6_000);   // partyB's 60% of the default sweep
 
       const terms = await show.ticketTerms();
       expect(terms.totalCapacity).to.equal(100);

@@ -20,6 +20,7 @@ contract ShowFactory is Ownable {
     error ZeroAddress();
     error FactoryPaused();
     error ArbitrationNotAvailable();
+    error BackendMismatch();
 
     struct ShowConfig {
         bytes32 showId;                               // optional client-chosen id; see deriveShowId
@@ -118,6 +119,7 @@ contract ShowFactory is Ownable {
     function createShow(ShowConfig calldata cfg) external returns (ShowBundle memory bundle) {
         if (paused) revert FactoryPaused();
         if (cfg.arbitrationEnabled && arbitrationAgent == address(0)) revert ArbitrationNotAvailable();
+        _requireBackendMatchesSweep(cfg);
 
         bytes32 showId = _showIdFor(msg.sender, cfg);
 
@@ -303,6 +305,26 @@ contract ShowFactory is Ownable {
         ticketImpl       = _ticketImpl;
         validatorImpl    = _validatorImpl;
         emit ImplementationsSet(_showInstanceImpl, _eventEscrowImpl, _ticketImpl, _validatorImpl);
+    }
+
+    /// @dev The backend is the share of what is left after the guarantees that
+    ///      goes to the other party (partyB), on top of its guarantee. The escrow
+    ///      pays what is left by its sweep rule, so partyB's share of the sweep has
+    ///      to be the backend the terms state. Otherwise the show would display one
+    ///      number and pay another. Others (an agent, a promoter) may take their
+    ///      own cut of the sweep; only partyB's share is compared. A show with no
+    ///      partyB has no backend to check.
+    function _requireBackendMatchesSweep(ShowConfig calldata cfg) internal pure {
+        address partyB = cfg.partyB.wallet;
+        if (partyB == address(0)) return;
+
+        uint256 share;
+        uint256 n = cfg.sweep.recipients.length;
+        if (cfg.sweep.bps.length < n) n = cfg.sweep.bps.length;
+        for (uint256 i = 0; i < n; i++) {
+            if (cfg.sweep.recipients[i] == partyB) share += cfg.sweep.bps[i];
+        }
+        if (share != cfg.financials.backendBPS) revert BackendMismatch();
     }
 
     function _showIdFor(address creator, ShowConfig calldata cfg) internal pure returns (bytes32) {

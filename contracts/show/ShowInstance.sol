@@ -82,7 +82,7 @@ contract ShowInstance is IGraphParties, IGraphAuthorizer {
     struct FinancialConfig {
         uint256 guaranteeUSDC;    // flat guarantee (mutually exclusive with pct)
         uint256 guaranteePctBPS;  // % of ticket sales as guarantee
-        uint256 backendBPS;       // artist % of revenue beyond guarantee
+        uint256 backendBPS;       // partyB's % of what is left after the guarantees; must match its share of the escrow's sweep
         uint256 barSplitBPS;
         uint256 merchSplitBPS;
     }

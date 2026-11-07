@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import "../interfaces/IGraphParties.sol";
+import "../interfaces/IEarnings.sol";
 
 /// @title StandingAgreement — one contract for every long-lived agreement (Phase 2A)
 /// @notice A relationship between one or two parties that outlasts any single
@@ -42,9 +43,6 @@ contract StandingAgreement is IGraphParties {
     enum AgreementKind { Generic, Membership, Representation, Employment, Partnership, Sponsorship, Crew }
 
     enum Status { Draft, Active, Terminated, Superseded }
-
-    /// @notice The money category a split or flat payment applies to.
-    enum Stream { Guarantee, TicketRevenue, MerchRevenue, BarRevenue, SponsorshipRevenue, Other }
 
     struct Split {
         address recipient;

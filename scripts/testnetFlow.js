@@ -604,6 +604,20 @@ async function main() {
     eq("every dollar the fan paid is accounted for", total, U(104));
     eq("main escrow is empty", await balance(shows.M.escrow.target), 0);
     eq("opener escrow is empty", await balance(shows.O.escrow.target), 0);
+
+    // The earnings ledger is in newer escrows only; an older deployment has no such function.
+    let hasLedger = true;
+    try { await shows.M.escrow.earnedBy(artist.address, 0); } catch (e) { hasLedger = false; }
+    if (!hasLedger) {
+      console.log("  (earnings ledger is not in this deployment, skipped)");
+    } else {
+      eq("ledger: artist's guarantee", await shows.M.escrow.earnedBy(artist.address, 0), U(50));
+      eq("ledger: artist's backend share", await shows.M.escrow.earnedBy(artist.address, 1), U("8.376"));
+      eq("ledger: venue's backend share", await shows.M.escrow.earnedBy(venue.address, 1), U("19.544"));
+      eq("ledger: band's guarantee, recorded in the opener's escrow", await shows.O.escrow.earnedBy(band.address, 0), U(20));
+      eq("ledger: Xao's fee is not an earning", await shows.M.escrow.earnedBy(treasury, 1), 0);
+      eq("ledger: money moved to the opener's escrow is not an earning", await shows.M.escrow.earnedBy(shows.O.escrow.target, 0), 0);
+    }
   });
 
   // ── Summary ──

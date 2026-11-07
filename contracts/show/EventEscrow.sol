@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "../interfaces/IShowBundle.sol";
+import "../interfaces/IEarnings.sol";
 
 /// @title EventEscrow — custody and payout engine for one show (Phase 2A)
 /// @notice Holds every dollar tied to a show: party deposits and ticket
@@ -17,7 +18,7 @@ import "../interfaces/IShowBundle.sol";
 ///      initialize(). A payment that the token refuses (for example a
 ///      blocked recipient) is parked for that recipient to claim, so one bad
 ///      address cannot stall refunds or payouts for everyone else.
-contract EventEscrow is ReentrancyGuard {
+contract EventEscrow is IEarningsSource, ReentrancyGuard {
 
     error AlreadyInitialized();
     error NotFactory();
@@ -183,6 +184,9 @@ contract EventEscrow is ReentrancyGuard {
     /// @notice Set on an opener's escrow: the main show escrow it is linked to.
     address public parentEscrow;
 
+    /// @dev What each recipient has earned from this escrow, by stream. See IEarningsSource.
+    mapping(address => mapping(Stream => uint256)) internal _earned;
+
     // Refunds
     uint16  public defaultCancelRefundBps;
     uint16  public refundBps;
@@ -222,6 +226,7 @@ contract EventEscrow is ReentrancyGuard {
     event PaymentHeld(address indexed recipient, uint256 amount);
     event Claimed(address indexed recipient, uint256 amount);
     event LateFundsDistributed(uint256 amount);
+    event Earned(address indexed recipient, Stream indexed stream, uint256 amount);
 
     event AgreementLinked(address indexed agreement);
     event AttachedToParent(address indexed parent);
@@ -393,7 +398,7 @@ contract EventEscrow is ReentrancyGuard {
             }
 
             rule.executed = true;
-            _pay(rule.to, amount);
+            _payEarning(rule.to, amount, rule.isGuarantee ? Stream.Guarantee : Stream.Other);
             emit PayoutExecuted(i, rule.to, amount);
         }
     }
@@ -414,7 +419,7 @@ contract EventEscrow is ReentrancyGuard {
 
         _payProtocolFee();
         uint256 amount = distributable();
-        _splitBySweep(amount);
+        _splitBySweep(amount, Stream.TicketRevenue);
 
         emit FinalSweepExecuted(amount);
         emit EscrowCompleted();
@@ -509,8 +514,8 @@ contract EventEscrow is ReentrancyGuard {
             toB = 0;
         }
 
-        _pay(partyA, toA);
-        _pay(partyB, toB);
+        _payEarning(partyA, toA, Stream.Other);
+        _payEarning(partyB, toB, Stream.Other);
         _pay(treasury, toTreasury);
 
         emit CancellationFinalized(ruleIndex, toA, toB, toTreasury);
@@ -558,7 +563,7 @@ contract EventEscrow is ReentrancyGuard {
 
         status = EscrowStatus.Completed;
         _payProtocolFee();
-        _pay(resolution == Resolution.ReleaseToPartyA ? partyA : partyB, distributable());
+        _payEarning(resolution == Resolution.ReleaseToPartyA ? partyA : partyB, distributable(), Stream.Other);
         emit EscrowCompleted();
         show.onCompleted();
     }
@@ -596,7 +601,7 @@ contract EventEscrow is ReentrancyGuard {
         if (status != EscrowStatus.Completed) revert NotCompleted();
         uint256 amount = distributable();
         if (amount == 0) revert NothingToDistribute();
-        _splitBySweep(amount);
+        _splitBySweep(amount, Stream.Other);
         emit LateFundsDistributed(amount);
     }
 
@@ -685,6 +690,11 @@ contract EventEscrow is ReentrancyGuard {
     /// @notice When the open dispute times out, or zero when there is none.
     function disputeDeadline() external view returns (uint256) {
         return activeCaseId == bytes32(0) ? 0 : uint256(disputeOpenedAt) + DISPUTE_TIMEOUT;
+    }
+
+    /// @inheritdoc IEarningsSource
+    function earnedBy(address recipient, Stream stream) external view override returns (uint256) {
+        return _earned[recipient][stream];
     }
 
     function getLinkedAgreements() external view returns (address[] memory) {
@@ -849,14 +859,24 @@ contract EventEscrow is ReentrancyGuard {
     }
 
     /// @dev The last recipient takes the rounding remainder so nothing is left behind.
-    function _splitBySweep(uint256 amount) internal {
+    function _splitBySweep(uint256 amount, Stream stream) internal {
         uint256 n = sweepRule.recipients.length;
         uint256 paid;
         for (uint256 i = 0; i < n; i++) {
             uint256 share = i == n - 1 ? amount - paid : amount * sweepRule.bps[i] / 10_000;
             paid += share;
-            _pay(sweepRule.recipients[i], share);
+            _payEarning(sweepRule.recipients[i], share, stream);
         }
+    }
+
+    /// @dev Pays something the recipient earned and records it. Refunds to ticket
+    ///      holders, the protocol fee and money moved between linked escrows are
+    ///      not earnings and use _pay directly.
+    function _payEarning(address to, uint256 amount, Stream stream) internal {
+        if (amount == 0) return;
+        _earned[to][stream] += amount;
+        emit Earned(to, stream, amount);
+        _pay(to, amount);
     }
 
     /// @dev Sends `amount`, or parks it for the recipient if the token refuses.

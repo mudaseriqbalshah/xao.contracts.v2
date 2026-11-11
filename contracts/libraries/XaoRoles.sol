@@ -24,4 +24,16 @@ library XaoRoles {
     bytes32 internal constant TRIAL_GRANT     = keccak256("TRIAL_GRANT");
     bytes32 internal constant TEMP_GRANT      = keccak256("TEMP_GRANT");
     bytes32 internal constant CUSTOM_GRANT    = keccak256("CUSTOM_GRANT");
+
+    /// @dev True for the five standard roles.
+    function isRole(bytes32 role) internal pure returns (bool) {
+        return role == ROLE_MEMBER || role == ROLE_OPERATOR || role == ROLE_TREASURER
+            || role == ROLE_ADMIN || role == ROLE_OWNER;
+    }
+
+    /// @dev True for the eight standard grant types.
+    function isGrantType(bytes32 t) internal pure returns (bool) {
+        return t == OWNER_GRANT || t == ADMIN_GRANT || t == TREASURER_GRANT || t == OPERATOR_GRANT
+            || t == MEMBER_GRANT || t == TRIAL_GRANT || t == TEMP_GRANT || t == CUSTOM_GRANT;
+    }
 }

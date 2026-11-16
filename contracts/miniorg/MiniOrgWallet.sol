@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "../interfaces/IMiniOrg.sol";
 import "../interfaces/IGraphAuthorizer.sol";
+import "../interfaces/IGraphParties.sol";
 import "../libraries/XaoRoles.sol";
 
 /// @title MiniOrgWallet — the on-chain identity and membership hub of a band, venue, promoter or crew (Phase 2D)
 /// @notice This address is the org's identity: it can be partyA or partyB of
 ///         shows, tours and standing agreements. Who may act for it is decided
-///         by the grant contracts attached to it. This first part holds the
-///         identity, the grant registry and the permission checks; acting as a
-///         party (signing, funding) and the treasury controls come next.
+///         by the grant contracts attached to it: owners, admins and operators
+///         act as the org towards the contracts it is a party of (signing,
+///         claiming); treasurers and owners move the org's tokens. The org's own
+///         graph links (OWNED_BY, PARTICIPATES_AS, ...) are registered straight in
+///         GraphRegistry, which asks this wallet's isGraphOperator.
 /// @dev Deployed as a minimal-proxy clone by MiniOrgFactory.
 ///
 ///      Rules (client-confirmed):
@@ -26,6 +31,7 @@ import "../libraries/XaoRoles.sol";
 ///          checks cannot run out of gas.
 ///        - Owner grants are permanent and end only here (see MiniOrgGrant).
 contract MiniOrgWallet is IMiniOrgWallet, IGraphAuthorizer {
+    using SafeERC20 for IERC20;
 
     error AlreadyInitialized();
     error ZeroAddress();
@@ -38,6 +44,8 @@ contract MiniOrgWallet is IMiniOrgWallet, IGraphAuthorizer {
     error GrantNotAttached();
     error TooManyGrants();
     error CannotEndLastOwner();
+    error NotAPartyContract();
+    error TreasuryIsElsewhere();
 
     uint256 public constant MAX_GRANTS      = 50;
     uint256 public constant MAX_ROOT_ADMINS = 10;
@@ -64,6 +72,9 @@ contract MiniOrgWallet is IMiniOrgWallet, IGraphAuthorizer {
     event BootstrapModeEnded();
     event GrantAdded(address indexed grant, bytes32 grantType);
     event GrantDisabled(address indexed grant);
+    event ExecutedAsParty(address indexed by, address indexed target, bytes4 selector);
+    event ERC20Transferred(address indexed token, address indexed to, uint256 amount);
+    event ERC20Approved(address indexed token, address indexed spender, uint256 amount);
 
     /// @dev Locks the implementation; only clones can be initialized.
     constructor() {
@@ -221,5 +232,67 @@ contract MiniOrgWallet is IMiniOrgWallet, IGraphAuthorizer {
         if (newTreasury == address(0)) revert ZeroAddress();
         treasury = newTreasury;
         emit TreasuryUpdated(newTreasury);
+    }
+
+    // ─── ACTING AS A PARTY ────────────────────────────────────────────────
+
+    /// @notice Call a contract this org is a party of (a show, its escrow, a tour,
+    ///         a standing agreement, ...) as the org: sign its terms, claim what
+    ///         it owes, and so on. Owners, admins and operators may do this.
+    ///         Only contracts that name this wallet as partyA or partyB can be
+    ///         called, so the wallet cannot be pointed at a token or anything else.
+    /// @dev The org's tokens move only through transferERC20 and approveERC20,
+    ///      which need a treasurer or an owner. An operator cannot create an
+    ///      allowance, so calling `deposit` on an escrow moves only what a
+    ///      treasurer already approved.
+    function executeAsParty(address target, bytes calldata data) external returns (bytes memory result) {
+        if (!_isOperatorOrAbove(msg.sender)) revert NotAuthorized();
+        if (!_isPartyOf(target)) revert NotAPartyContract();
+
+        bool ok;
+        (ok, result) = target.call(data);
+        if (!ok) {
+            assembly { revert(add(result, 32), mload(result)) }      // pass the target's own error up
+        }
+        emit ExecutedAsParty(msg.sender, target, data.length >= 4 ? bytes4(data[:4]) : bytes4(0));
+    }
+
+    // ─── TREASURY (only when this wallet itself holds the funds) ──────────
+
+    /// @notice Pay tokens out of the org's funds. Treasurers and owners only.
+    function transferERC20(address token, address to, uint256 amount) external {
+        _requireTreasuryHere();
+        IERC20(token).safeTransfer(to, amount);
+        emit ERC20Transferred(token, to, amount);
+    }
+
+    /// @notice Let `spender` (for example a show's escrow) pull up to `amount`.
+    function approveERC20(address token, address spender, uint256 amount) external {
+        _requireTreasuryHere();
+        IERC20(token).forceApprove(spender, amount);
+        emit ERC20Approved(token, spender, amount);
+    }
+
+    // ─── INTERNAL ─────────────────────────────────────────────────────────
+
+    function _isOperatorOrAbove(address who) internal view returns (bool) {
+        return hasRole(who, XaoRoles.ROLE_OWNER)
+            || hasRole(who, XaoRoles.ROLE_ADMIN)
+            || hasRole(who, XaoRoles.ROLE_OPERATOR);
+    }
+
+    function _requireTreasuryHere() internal view {
+        if (treasury != address(this)) revert TreasuryIsElsewhere();
+        if (!hasRole(msg.sender, XaoRoles.ROLE_TREASURER) && !hasRole(msg.sender, XaoRoles.ROLE_OWNER)) {
+            revert NotAuthorized();
+        }
+    }
+
+    function _isPartyOf(address target) internal view returns (bool) {
+        if (target.code.length == 0) return false;
+        (bool okA, bytes memory a) = target.staticcall(abi.encodeCall(IGraphParties.partyA, ()));
+        if (okA && a.length >= 32 && address(uint160(uint256(bytes32(a)))) == address(this)) return true;
+        (bool okB, bytes memory b) = target.staticcall(abi.encodeCall(IGraphParties.partyB, ()));
+        return okB && b.length >= 32 && address(uint160(uint256(bytes32(b)))) == address(this);
     }
 }

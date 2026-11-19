@@ -226,6 +226,10 @@ function buildConfig(o) {
           partyBResaleBPS: 500,
           resellerBPS: 9_000,
           image: "ipfs://ga",
+          gateMode: 0,
+          gateModule: "0x0000000000000000000000000000000000000000",
+          gateId: 0,
+          presaleFrom: 0,
         }]
       : [],
     funding: o.funding || [],

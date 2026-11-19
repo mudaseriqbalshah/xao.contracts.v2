@@ -11,6 +11,7 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/utils/Base64.sol";
 import "../interfaces/IShowBundle.sol";
 import "../libraries/DiscountMath.sol";
+import "../interfaces/IPerkModule.sol";
 
 /// @title XAOTicketV2 — ERC-1155 NFT tickets for one show (Phase 2A)
 /// @notice Sells tickets the same way XAOTicket does: price tiers, lazy mint at
@@ -35,6 +36,8 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
     error ShowNotSigned();
     error InvalidTier();
     error NotOnSaleYet();
+    error InvalidGate();
+    error NotEligibleForTier();
     error SoldOut();
     error CapacityReached();
     error NotEntryValidator();
@@ -52,6 +55,15 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
     // ─── TICKET TYPE ENUM ─────────────────────────────────────────────────
     enum TicketType { COMP, PRESALE, GENERAL_ADMISSION, VIP, CUSTOM }
 
+    /// @dev Who may buy a tier, decided by a perk module the parties name when they set the show up.
+    ///      NONE: anyone, from the tier's on-sale time.
+    ///      PRESALE: holders of a PRESALE_ACCESS perk may buy from `presaleFrom`, before the
+    ///               general on-sale time; after that anyone may.
+    ///      MEMBERS_ONLY: only holders of an EVENT_ACCESS perk may buy, whenever it is on sale.
+    ///      The perk is only looked at, never used up, so a holder can buy as many tickets as the
+    ///      show allows. Use passive-check perks for gates.
+    enum GateMode { NONE, PRESALE, MEMBERS_ONLY }
+
     // ─── STORAGE ──────────────────────────────────────────────────────────
     struct TicketTier {
         TicketType ticketType;
@@ -65,6 +77,10 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
         uint256    partyBResaleBPS;
         uint256    resellerBPS;
         string     image;           // NFT artwork for this ticket type (IPFS/HTTP URI)
+        GateMode   gateMode;
+        address    gateModule;      // the perk module asked
+        uint256    gateId;          // the perk in that module
+        uint256    presaleFrom;     // PRESALE: when perk holders may start buying
     }
 
     /// @dev Calldata-friendly shape of one tier.
@@ -78,6 +94,10 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
         uint256    partyBResaleBPS;
         uint256    resellerBPS;
         string     image;
+        GateMode   gateMode;
+        address    gateModule;
+        uint256    gateId;
+        uint256    presaleFrom;
     }
 
     struct TicketData {
@@ -130,6 +150,7 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
     bool public initialized;
 
     // ─── EVENTS ───────────────────────────────────────────────────────────
+    event TierGated(uint256 indexed tierId, GateMode mode, address indexed module, uint256 perkId, uint256 presaleFrom);
     event TierAdded(
         uint256 indexed tierId,
         TicketType      ticketType,
@@ -192,10 +213,29 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
         if (show.anySigned()) revert TiersLocked();
     }
 
+    /// @dev Asks the tier's perk module whether the buyer qualifies. A module that
+    ///      fails to answer counts as a no: the gate closes rather than opens.
+    function _gatePasses(TicketTier storage tier) internal view returns (bool) {
+        IPerkModule.PerkContext memory ctx;     // nothing to prove: the perk is about the wallet
+        if (tier.gateMode == GateMode.PRESALE) {
+            try IPerkModule(tier.gateModule).hasPresaleAccess(msg.sender, tier.gateId, ctx) returns (bool ok) { return ok; }
+            catch { return false; }
+        }
+        try IPerkModule(tier.gateModule).hasAccess(msg.sender, tier.gateId, ctx) returns (bool ok) { return ok; }
+        catch { return false; }
+    }
+
     function _addTierUnchecked(TierInput memory t) internal returns (uint256 tierId) {
         if (t.quantity == 0) revert ZeroQuantity();
         if (t.partyAResaleBPS + t.partyBResaleBPS + t.resellerBPS != 10_000) {
             revert ResaleBpsMustSumTo10000();
+        }
+        if (t.gateMode != GateMode.NONE) {
+            if (t.gateModule.code.length == 0) revert InvalidGate();
+            // A presale has to open before the general sale, so the general sale needs a time.
+            if (t.gateMode == GateMode.PRESALE && (t.onSaleTimestamp == 0 || t.presaleFrom >= t.onSaleTimestamp)) {
+                revert InvalidGate();
+            }
         }
         tierId = tierCount;
         tiers[tierId] = TicketTier({
@@ -208,9 +248,14 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
             partyAResaleBPS: t.partyAResaleBPS,
             partyBResaleBPS: t.partyBResaleBPS,
             resellerBPS:     t.resellerBPS,
-            image:           t.image
+            image:           t.image,
+            gateMode:        t.gateMode,
+            gateModule:      t.gateModule,
+            gateId:          t.gateId,
+            presaleFrom:     t.presaleFrom
         });
         tierCount++;
+        if (t.gateMode != GateMode.NONE) emit TierGated(tierId, t.gateMode, t.gateModule, t.gateId, t.presaleFrom);
         emit TierAdded(tierId, t.ticketType, t.priceUSDC, t.quantity);
     }
 
@@ -244,7 +289,12 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
         if (!show.isFinalized()) revert ShowNotSigned();
         if (tierId >= tierCount) revert InvalidTier();
         TicketTier storage tier = tiers[tierId];
-        if (block.timestamp < tier.onSaleTimestamp) revert NotOnSaleYet();
+        if (tier.gateMode == GateMode.MEMBERS_ONLY && !_gatePasses(tier)) revert NotEligibleForTier();
+        if (block.timestamp < tier.onSaleTimestamp) {
+            // Before the general sale only a presale tier is open, and only to its perk holders.
+            if (tier.gateMode != GateMode.PRESALE || block.timestamp < tier.presaleFrom) revert NotOnSaleYet();
+            if (!_gatePasses(tier)) revert NotEligibleForTier();
+        }
         if (tier.sold >= tier.quantity) revert SoldOut();
         if (totalSold >= totalCapacity) revert CapacityReached();
 

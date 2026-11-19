@@ -40,6 +40,10 @@ function tier(overrides = {}) {
     partyBResaleBPS: 500,
     resellerBPS: 9_000,
     image: "ipfs://ga",
+    gateMode: 0,
+    gateModule: ZERO_ADDRESS,
+    gateId: 0,
+    presaleFrom: 0,
     ...overrides,
   };
 }

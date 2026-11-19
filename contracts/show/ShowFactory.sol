@@ -21,6 +21,8 @@ contract ShowFactory is Ownable {
     error FactoryPaused();
     error ArbitrationNotAvailable();
     error BackendMismatch();
+    error InvalidSalesTax();
+    error InvalidTaxReceiver();
 
     struct ShowConfig {
         bytes32 showId;                               // optional client-chosen id; see deriveShowId
@@ -120,6 +122,7 @@ contract ShowFactory is Ownable {
         if (paused) revert FactoryPaused();
         if (cfg.arbitrationEnabled && arbitrationAgent == address(0)) revert ArbitrationNotAvailable();
         _requireBackendMatchesSweep(cfg);
+        _requireValidTax(cfg);
 
         bytes32 showId = _showIdFor(msg.sender, cfg);
 
@@ -153,6 +156,7 @@ contract ShowFactory is Ownable {
                 partyB:                 cfg.partyB.wallet,
                 payoutToken:            payoutToken,
                 treasury:               treasury,
+                taxReceiver:            cfg.tickets.taxReceiver,
                 funding:                cfg.funding,
                 payoutRules:            cfg.payoutRules,
                 sweep:                  cfg.sweep,
@@ -178,6 +182,7 @@ contract ShowFactory is Ownable {
                     admin:          cfg.partyA.wallet,
                     eventName:      cfg.promo.eventName,
                     totalCapacity:  cfg.tickets.totalCapacity,
+                    salesTaxBPS:    cfg.tickets.salesTaxBPS,
                     tiers:          cfg.tiers
                 })
             );
@@ -314,6 +319,16 @@ contract ShowFactory is Ownable {
     ///      number and pay another. Others (an agent, a promoter) may take their
     ///      own cut of the sweep; only partyB's share is compared. A show with no
     ///      partyB has no backend to check.
+    /// @dev Sales tax needs someone to pay it to the government: partyA or partyB.
+    function _requireValidTax(ShowConfig calldata cfg) internal pure {
+        if (!cfg.tickets.ticketsEnabled || cfg.tickets.salesTaxBPS == 0) return;
+        if (cfg.tickets.salesTaxBPS > 10_000) revert InvalidSalesTax();
+        address receiver = cfg.tickets.taxReceiver;
+        if (receiver == address(0) || (receiver != cfg.partyA.wallet && receiver != cfg.partyB.wallet)) {
+            revert InvalidTaxReceiver();
+        }
+    }
+
     function _requireBackendMatchesSweep(ShowConfig calldata cfg) internal pure {
         address partyB = cfg.partyB.wallet;
         if (partyB == address(0)) return;

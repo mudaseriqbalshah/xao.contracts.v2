@@ -109,7 +109,8 @@ function showConfig(promoter, artist, t0, overrides = {}) {
     tickets: {
       ticketsEnabled: true,
       totalCapacity: 100,
-      salesTaxBPS: 800,
+      salesTaxBPS: 0,
+      taxReceiver: ZERO_ADDRESS,
       compTickets: 5,
       resalePartyABPS: 500,
       resalePartyBBPS: 500,

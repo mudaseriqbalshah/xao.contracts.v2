@@ -10,6 +10,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/utils/Base64.sol";
 import "../interfaces/IShowBundle.sol";
+import "../libraries/DiscountMath.sol";
 
 /// @title XAOTicketV2 — ERC-1155 NFT tickets for one show (Phase 2A)
 /// @notice Sells tickets the same way XAOTicket does: price tiers, lazy mint at
@@ -88,6 +89,7 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
         uint256 pricePaid;      // gross price the buyer paid
         uint256 escrowed;       // part of it that reached the escrow
         uint256 protocolFee;    // part of `escrowed` held for XAO
+        uint256 tax;            // part of `escrowed` held for the tax receiver
     }
 
     struct TicketInit {
@@ -99,6 +101,7 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
         address     admin;          // partyA
         string      eventName;
         uint256     totalCapacity;
+        uint256     salesTaxBPS;    // share of the list price held as sales tax
         TierInput[] tiers;
     }
 
@@ -108,6 +111,7 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
     IERC20  public usdc;
     address public treasury;
     uint256 public totalCapacity;
+    uint256 public salesTaxBPS;
 
     string public eventName;
     string public metadataDNSLink;
@@ -168,6 +172,7 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
         treasury       = init.treasury;
         eventName      = init.eventName;
         totalCapacity  = init.totalCapacity;
+        salesTaxBPS    = init.salesTaxBPS;
 
         // partyA administers the collection and can grant ADMIN_ROLE to others.
         _grantRole(DEFAULT_ADMIN_ROLE, init.admin);
@@ -245,11 +250,13 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
 
         uint256 gross = tier.priceUSDC;
 
-        // Gas allotment is capped at the price; the XAO fee at what is left.
-        uint256 gasFee      = gross < GAS_ALLOTMENT ? gross : GAS_ALLOTMENT;
-        uint256 escrowed    = gross - gasFee;
-        uint256 protocolFee = gross * XAO_FEE_BPS / 10_000;
-        if (protocolFee > escrowed) protocolFee = escrowed;
+        // Gas, XAO's fee and the sales tax are each a share of the list price, squeezed
+        // in that order if the ticket is too cheap to hold them (see DiscountMath).
+        DiscountMath.Breakdown memory parts = DiscountMath.breakdown(gross, salesTaxBPS, XAO_FEE_BPS, GAS_ALLOTMENT);
+        uint256 gasFee      = parts.gas;
+        uint256 escrowed    = gross - gasFee;      // fee and tax stay inside it, so a refund returns them
+        uint256 protocolFee = parts.fee;
+        uint256 tax         = parts.tax;
 
         tokenId = ++lastMintedId;
         tokenToTier[tokenId] = tierId;
@@ -263,7 +270,8 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
             refunded:    false,
             pricePaid:   gross,
             escrowed:    escrowed,
-            protocolFee: protocolFee
+            protocolFee: protocolFee,
+            tax:         tax
         });
 
         if (gross > 0) {
@@ -272,7 +280,7 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
             if (escrowed > 0) usdc.safeTransfer(escrow, escrowed);
         }
         // Always reported, so the escrow rejects sales it is not open for.
-        IEventEscrowLike(escrow).creditTicketSale(escrowed, protocolFee);
+        IEventEscrowLike(escrow).creditTicketSale(escrowed, protocolFee, tax);
 
         _mint(msg.sender, tokenId, 1, "");
 
@@ -403,9 +411,9 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
         return ticketData[tokenId].pricePaid;
     }
 
-    function getRefundBasis(uint256 tokenId) external view returns (uint256 escrowed, uint256 protocolFee) {
+    function getRefundBasis(uint256 tokenId) external view returns (uint256 escrowed, uint256 protocolFee, uint256 tax) {
         TicketData storage t = ticketData[tokenId];
-        return (t.escrowed, t.protocolFee);
+        return (t.escrowed, t.protocolFee, t.tax);
     }
 
     function isRefunded(uint256 tokenId) external view returns (bool) {

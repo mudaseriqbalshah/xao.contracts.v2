@@ -71,7 +71,8 @@ contract ShowInstance is IGraphParties, IGraphAuthorizer {
     struct TicketTerms {
         bool    ticketsEnabled;
         uint256 totalCapacity;
-        uint256 salesTaxBPS;
+        uint256 salesTaxBPS;      // taken from the ticket's list price; held in escrow until the show is completed
+        address taxReceiver;      // partyA or partyB: who pays the tax to the government. Required when salesTaxBPS > 0
         uint256 compTickets;
         // Default resale royalty split (BPS). All zero, or summing to 10000.
         uint256 resalePartyABPS;

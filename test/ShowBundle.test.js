@@ -260,7 +260,8 @@ describe("Show bundle", function () {
 
       const terms = await show.ticketTerms();
       expect(terms.totalCapacity).to.equal(100);
-      expect(terms.salesTaxBPS).to.equal(800);
+      expect(terms.salesTaxBPS).to.equal(0);
+      expect(terms.taxReceiver).to.equal(ethers.ZeroAddress);
       expect(terms.compTickets).to.equal(5);
 
       expect(await show.eventName()).to.equal("Test Show");
@@ -517,7 +518,7 @@ describe("Show bundle", function () {
       expect(await ticket.ownerOf(1)).to.equal(fan1.address);
       expect(await ticket.ownerOf(2)).to.equal(fan2.address);
       expect(await ticket.getPricePaid(1)).to.equal(TICKET_PRICE);
-      expect(await ticket.getRefundBasis(1)).to.deep.equal([ESCROWED, XAO_FEE]);
+      expect(await ticket.getRefundBasis(1)).to.deep.equal([ESCROWED, XAO_FEE, 0n]);
       expect(await ticket.exists(3)).to.equal(false);
       expect(await ticket.totalSold()).to.equal(2);
       expect((await ticket.getTier(0)).sold).to.equal(2);
@@ -540,7 +541,7 @@ describe("Show bundle", function () {
       await b.ticket.connect(fan1).buyTicket(0);
       expect(await usdc.balanceOf(treasury.address)).to.equal(USDC("0.5"));
       expect(await usdc.balanceOf(b.escrow.target)).to.equal(0);
-      expect(await b.ticket.getRefundBasis(1)).to.deep.equal([0n, 0n]);
+      expect(await b.ticket.getRefundBasis(1)).to.deep.equal([0n, 0n, 0n]);
 
       await b.ticket.connect(fan2).buyTicket(1);
       expect(await b.ticket.ownerOf(2)).to.equal(fan2.address);
@@ -748,7 +749,7 @@ describe("Show bundle", function () {
         .to.be.revertedWithCustomError(escrowImpl, "NotFactory");
       await expect(escrow.connect(promoter).setTicketContract(stranger.address))
         .to.be.revertedWithCustomError(escrow, "NotFactory");
-      await expect(escrow.connect(stranger).creditTicketSale(1, 0))
+      await expect(escrow.connect(stranger).creditTicketSale(1, 0, 0))
         .to.be.revertedWithCustomError(escrow, "NotTicketContract");
     });
 

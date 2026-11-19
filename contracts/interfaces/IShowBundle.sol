@@ -27,7 +27,7 @@ interface IShowInstanceLike {
 interface IEventEscrowLike {
     /// @notice Called by the ticket contract after it has transferred
     ///         `escrowed` to the escrow; `protocolFee` of that is held for XAO.
-    function creditTicketSale(uint256 escrowed, uint256 protocolFee) external;
+    function creditTicketSale(uint256 escrowed, uint256 protocolFee, uint256 tax) external;
 }
 
 /// @notice What a main show escrow and an opener's escrow need from each other.
@@ -58,7 +58,7 @@ interface IShowTicketLike {
     function lastMintedId() external view returns (uint256);
     /// @return escrowed    what reached the escrow for this ticket
     /// @return protocolFee the part of `escrowed` held for XAO
-    function getRefundBasis(uint256 tokenId) external view returns (uint256 escrowed, uint256 protocolFee);
+    function getRefundBasis(uint256 tokenId) external view returns (uint256 escrowed, uint256 protocolFee, uint256 tax);
     function burnRefunded(uint256 tokenId) external;
     function scan(uint256 tokenId, bytes32 gateId) external returns (bool accepted);
 }

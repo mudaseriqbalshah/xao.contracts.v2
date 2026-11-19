@@ -177,6 +177,7 @@ function buildConfig(o) {
       ticketsEnabled: !!o.tickets,
       totalCapacity: 100,
       salesTaxBPS: 0,
+      taxReceiver: "0x0000000000000000000000000000000000000000",
       compTickets: 0,
       resalePartyABPS: 500,
       resalePartyBBPS: 500,

@@ -119,6 +119,7 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
         address            partyB;     // may be address(0)
         address            payoutToken;
         address            treasury;
+        address            taxReceiver; // paid the held sales tax when the show is completed; zero if there is no tax
         FundingMilestone[] funding;
         PayoutRuleInput[]  payoutRules;
         SweepRule          sweep;
@@ -161,6 +162,11 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
     uint256 public totalFunded;
     /// @notice XAO's share of ticket sales, held until the show completes.
     uint256 public protocolFeeAccrued;
+
+    /// @notice Sales tax collected with ticket sales, held until the show is completed (paid to
+    ///         `taxReceiver`) or the tickets are refunded. It is never available for payouts.
+    address public taxReceiver;
+    uint256 public taxAccrued;
     /// @notice Payments the token refused, waiting for their recipient to claim.
     mapping(address => uint256) public unclaimed;
     uint256 public unclaimedTotal;
@@ -210,6 +216,8 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
     event PayoutExecuted(uint256 indexed ruleIndex, address indexed to, uint256 amount);
     event PayoutSkipped(uint256 indexed ruleIndex, uint256 required, uint256 available);
     event ProtocolFeePaid(uint256 amount);
+    event TaxHeld(uint256 amount);
+    event TaxPaid(address indexed to, uint256 amount);
     event FinalSweepExecuted(uint256 amount);
     event EscrowCompleted();
 
@@ -277,6 +285,7 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
         partyB      = init.partyB;
         payoutToken = IERC20(init.payoutToken);
         treasury    = init.treasury;
+        taxReceiver = init.taxReceiver;
         defaultCancelRefundBps = init.defaultCancelRefundBps;
 
         uint64 last;
@@ -354,11 +363,13 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
 
     /// @notice Called by the ticket contract right after it has transferred
     ///         `escrowed` here. `protocolFee` of it is held for XAO.
-    function creditTicketSale(uint256 escrowed, uint256 protocolFee) external whenActive notFrozen {
+    function creditTicketSale(uint256 escrowed, uint256 protocolFee, uint256 tax) external whenActive notFrozen {
         if (msg.sender != ticketContract) revert NotTicketContract();
         protocolFeeAccrued += protocolFee;
-        totalFunded += escrowed - protocolFee;
+        taxAccrued += tax;
+        totalFunded += escrowed - protocolFee - tax;
         emit TicketRevenueReceived(escrowed, protocolFee);
+        if (tax != 0) emit TaxHeld(tax);
     }
 
     // ─── NORMAL PAYOUTS ───────────────────────────────────────────────────
@@ -417,7 +428,7 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
         sweepExecuted = true;
         status = EscrowStatus.Completed;
 
-        _payProtocolFee();
+        _payHeldFees();
         uint256 amount = distributable();
         _splitBySweep(amount, Stream.TicketRevenue);
 
@@ -473,11 +484,11 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
 
             if (refunded[tokenId] || !ticket.exists(tokenId)) continue;
 
-            (uint256 escrowed, uint256 protocolFee) = ticket.getRefundBasis(tokenId);
+            (uint256 escrowed, uint256 protocolFee, uint256 tax) = ticket.getRefundBasis(tokenId);
             uint256 amount    = escrowed * refundBps / 10_000;
-            uint256 feeWaived = protocolFee * refundBps / 10_000;
 
-            protocolFeeAccrued -= feeWaived;
+            protocolFeeAccrued -= protocolFee * refundBps / 10_000;
+            taxAccrued         -= tax * refundBps / 10_000;
             if (amount > distributable()) revert InsufficientFundsForRefund();
 
             address recipient = ticket.ownerOf(tokenId);
@@ -500,7 +511,7 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
         if (refundCursor <= maxRefundTokenId) revert RefundsNotFinished();
 
         status = EscrowStatus.Completed;
-        _payProtocolFee();
+        _payHeldFees();
 
         uint256 ruleIndex = _cancelRuleIndexAt(cancelledAt);
         CancelRule storage rule = cancelRules[ruleIndex];
@@ -562,7 +573,7 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
         if (resolution == Resolution.Resume) return;
 
         status = EscrowStatus.Completed;
-        _payProtocolFee();
+        _payHeldFees();
         _payEarning(resolution == Resolution.ReleaseToPartyA ? partyA : partyB, distributable(), Stream.Other);
         emit EscrowCompleted();
         show.onCompleted();
@@ -733,7 +744,7 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
     /// @notice Balance not already owed to XAO or to a held payment.
     function distributable() public view returns (uint256) {
         uint256 balance  = escrowBalance();
-        uint256 reserved = protocolFeeAccrued + unclaimedTotal + (earmarksVoid ? 0 : totalEarmarked);
+        uint256 reserved = protocolFeeAccrued + taxAccrued + unclaimedTotal + (earmarksVoid ? 0 : totalEarmarked);
         return balance > reserved ? balance - reserved : 0;
     }
 
@@ -850,12 +861,21 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
         return len - 1;
     }
 
-    function _payProtocolFee() internal {
+    /// @dev At the end of the show (or of a cancellation or dispute): XAO's fee to the
+    ///      treasury and the held sales tax to its receiver. Neither is an earning.
+    function _payHeldFees() internal {
         uint256 fee = protocolFeeAccrued;
-        if (fee == 0) return;
-        protocolFeeAccrued = 0;
-        _pay(treasury, fee);
-        emit ProtocolFeePaid(fee);
+        if (fee != 0) {
+            protocolFeeAccrued = 0;
+            _pay(treasury, fee);
+            emit ProtocolFeePaid(fee);
+        }
+        uint256 tax = taxAccrued;
+        if (tax != 0) {
+            taxAccrued = 0;
+            _pay(taxReceiver, tax);
+            emit TaxPaid(taxReceiver, tax);
+        }
     }
 
     /// @dev The last recipient takes the rounding remainder so nothing is left behind.

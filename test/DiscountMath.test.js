@@ -19,8 +19,8 @@ function member(o = {}) {
 const sum = (a) => a.reduce((x, y) => x + y, 0n);
 
 // An independent re-statement of the rules, used to cross-check the contract on random input.
-function reference(list, d, members) {
-  let left = list;
+function reference(list, net, d, members) {
+  let left = net;
   const dataDebits = d.grantedMasks.map(() => 0n);
   let dataDiscount = 0n;
   if (d.active) {
@@ -53,12 +53,14 @@ function reference(list, d, members) {
     debits.push(Array.from({ length: p.funderCount }, (_, i) => a / f + (BigInt(i) < a % f ? 1n : 0n)));
     applied.push(a); memberDiscount += a; left -= a;
   }
-  return { dataDiscount, memberDiscount, totalDiscount: dataDiscount + memberDiscount, netPrice: list - dataDiscount - memberDiscount, dataDebits, applied, debits };
+  return { dataDiscount, memberDiscount, totalDiscount: dataDiscount + memberDiscount, netAfter: net - dataDiscount - memberDiscount, dataDebits, applied, debits };
 }
 
 describe("DiscountMath", function () {
   let m;
-  const run = (list, d, members = []) => m.compute(list, d, members);
+  // `net` is the most that can be discounted; by default the whole price, so the data and
+  // membership examples below can be read on their own.
+  const run = (list, d, members = [], net = list) => m.compute(list, net, d, members);
 
   before(async function () {
     m = await (await ethers.getContractFactory("MockDiscountMath")).deploy();
@@ -70,7 +72,7 @@ describe("DiscountMath", function () {
       const r = await run($(20), data({ maxDiscount: $(2), categoryCount: 1, grantedMasks: [1, 1] }));
       expect(r.dataDiscount).to.equal($(2));
       expect([...r.dataDebits]).to.deep.equal([$(1), $(1)]);
-      expect(r.netPrice).to.equal($(18));
+      expect(r.netAfter).to.equal($(18));
     });
 
     it("T02: the same $2 offer with five funders costs each $0.40", async function () {
@@ -107,7 +109,7 @@ describe("DiscountMath", function () {
       const r = await run($(20), data({ maxDiscount: $(1), categoryCount: 4, grantedMasks: Array(5).fill(0) }));
       expect(r.dataDiscount).to.equal(0);
       expect(sum([...r.dataDebits])).to.equal(0);
-      expect(r.netPrice).to.equal($(20));
+      expect(r.netAfter).to.equal($(20));
     });
 
     it("T33: a category the buyer has no data for earns nothing, and is not charged to anyone else", async function () {
@@ -132,14 +134,14 @@ describe("DiscountMath", function () {
     it("an inactive program (already taken by this wallet, or switched off) gives nothing", async function () {
       const r = await run($(20), data({ active: false, maxDiscount: $(1), grantedMasks: [1, 1] }));
       expect(r.dataDiscount).to.equal(0);
-      expect(r.netPrice).to.equal($(20));
+      expect(r.netAfter).to.equal($(20));
     });
 
     it("never takes the price below zero: cells are used in order until the price is spent", async function () {
       const r = await run($(0.6), data({ maxDiscount: $(1), categoryCount: 1, grantedMasks: [1, 1] }));
       expect(r.dataDiscount).to.equal($(0.6));
       expect([...r.dataDebits]).to.deep.equal([$(0.5), $(0.1)]);
-      expect(r.netPrice).to.equal(0);
+      expect(r.netAfter).to.equal(0);
     });
 
     it("rejects input that makes no sense", async function () {
@@ -154,7 +156,7 @@ describe("DiscountMath", function () {
     it("a single program takes its amount off", async function () {
       const r = await run($(20), data({ active: false }), [member({ amount: $(2) })]);
       expect(r.memberDiscount).to.equal($(2));
-      expect(r.netPrice).to.equal($(18));
+      expect(r.netAfter).to.equal($(18));
       expect([...r.memberApplied]).to.deep.equal([$(2)]);
       expect([...r.memberDebits[0]]).to.deep.equal([$(2)]);
     });
@@ -214,7 +216,7 @@ describe("DiscountMath", function () {
         [member({ amount: $(1), funderCount: 1 })]);                                        // band's own member offer
       expect(r.dataDiscount).to.equal($(1));
       expect(r.memberDiscount).to.equal($(1));
-      expect(r.netPrice).to.equal($(18));
+      expect(r.netAfter).to.equal($(18));
       expect([...r.dataDebits]).to.deep.equal([$(0.5), $(0.5)]);
       expect([...r.memberDebits[0]]).to.deep.equal([$(1)]);
     });
@@ -224,7 +226,7 @@ describe("DiscountMath", function () {
         data({ maxDiscount: $(1), categoryCount: 1, grantedMasks: [1] }),
         [member({ priority: 1, amount: $(1) }), member({ priority: 2, amount: $(1) })]);
       expect(r.totalDiscount).to.equal($(3));
-      expect(r.netPrice).to.equal($(17));
+      expect(r.netAfter).to.equal($(17));
     });
 
     it("T21: on a $5 ticket, data first, then four $1 member benefits; the fifth is not applied or charged", async function () {
@@ -232,7 +234,7 @@ describe("DiscountMath", function () {
       const r = await run($(5), data({ maxDiscount: $(1), categoryCount: 1, grantedMasks: [1] }), progs);
       expect(r.dataDiscount).to.equal($(1));
       expect([...r.memberApplied]).to.deep.equal([$(1), $(1), $(1), $(1), 0n]);
-      expect(r.netPrice).to.equal(0);
+      expect(r.netAfter).to.equal(0);
       expect(sum([...r.memberDebits[4]])).to.equal(0);
     });
 
@@ -240,7 +242,7 @@ describe("DiscountMath", function () {
       const progs = [member({ priority: 1, amount: $(1) }), member({ priority: 2, amount: $(1) }), member({ priority: 3, amount: $(1) })];
       const r = await run($(2.4), data({ maxDiscount: $(1), categoryCount: 1, grantedMasks: [1] }), progs);
       expect([...r.memberApplied]).to.deep.equal([$(1), $(0.4), 0n]);
-      expect(r.netPrice).to.equal(0);
+      expect(r.netAfter).to.equal(0);
     });
 
     it("T14/T29: the earlier (headliner) program uses up the price before a later one", async function () {
@@ -259,28 +261,101 @@ describe("DiscountMath", function () {
     it("a free ticket stays free: nothing more is applied or charged (T24)", async function () {
       const r = await run(0, data({ maxDiscount: $(1), grantedMasks: [1] }), [member({ amount: $(1) })]);
       expect(r.totalDiscount).to.equal(0);
-      expect(r.netPrice).to.equal(0);
+      expect(r.netAfter).to.equal(0);
     });
   });
 
   // ─── TICKET AND FEE ─────────────────────────────────────────────────────
-  describe("ticket choice and fee", function () {
+  describe("ticket choice", function () {
     it("T08: five tickets, one carries all the savings: the highest priced, the first on a tie", async function () {
       expect(await m.selectTicket([$(20), $(20), $(20), $(20), $(20)])).to.equal(0);
       expect(await m.selectTicket([$(10), $(30), $(30), $(5)])).to.equal(1);
       await expect(m.selectTicket([])).to.be.revertedWithCustomError(m, "NoTickets");
     });
+  });
 
-    it("T25: the 2% fee is on the discounted price: 2% of $17 is $0.34, not 2% of $20", async function () {
-      expect(await m.feeOnNet($(17), 200)).to.equal($(0.34));
-      expect(await m.feeOnNet($(20), 200)).to.equal($(0.4));
-      expect(await m.feeOnNet(0, 200)).to.equal(0);
+  // ─── PRICE PARTS AND QUOTE ──────────────────────────────────────────────
+  describe("price parts and quote", function () {
+    let seed = 777;
+    const rnd = (n) => { seed = (seed * 1664525 + 1013904223) % 4294967296; return seed % n; };
+    const quote = (list, d, members) => m.quote(list, 800, 200, $(1), d, members);     // 8% tax, 2% Xao, $1 gas
+
+    it("a $20 ticket holds sales tax $1.60, gas $1, Xao's 2% $0.40 and a net of $17", async function () {
+      const b = await m.breakdown($(20), 800, 200, $(1));
+      expect(b.tax).to.equal($(1.6));
+      expect(b.gas).to.equal($(1));
+      expect(b.fee).to.equal($(0.4));
+      expect(b.net).to.equal($(17));
     });
 
-    it("the fee is rounded down, never up", async function () {
-      expect(await m.feeOnNet(49_999n, 200)).to.equal(999n);       // 999.98
-      expect(await m.feeOnNet(50_000n, 200)).to.equal(1_000n);
-      expect(await m.feeOnNet(1_234_567n, 200)).to.equal(24_691n);
+    it("the client's example: a $2 member discount makes the checkout $18, and a cancelled ticket refunds $17", async function () {
+      const q = await quote($(20), data({ active: false }), [member({ amount: $(2) })]);
+      expect(q.discounts.netBefore).to.equal($(17));
+      expect(q.discounts.netAfter).to.equal($(15));
+      expect(q.checkoutTotal).to.equal($(18));          // (17 - 2) + 1.60 tax + 1 gas + 0.40 Xao
+      expect(q.refundable).to.equal($(17));             // everything but the gas
+    });
+
+    it("Xao's fee, the tax and the gas do not shrink with a discount (spec v0.2 T25 said otherwise)", async function () {
+      const q = await quote($(20),
+        data({ maxDiscount: $(1), categoryCount: 1, grantedMasks: [1] }),
+        [member({ amount: $(2) })]);
+      expect(q.discounts.totalDiscount).to.equal($(3));
+      expect(q.parts.fee).to.equal($(0.4));             // not 2% of the discounted price
+      expect(q.parts.tax).to.equal($(1.6));
+      expect(q.parts.gas).to.equal($(1));
+      expect(q.checkoutTotal).to.equal($(17));
+    });
+
+    it("discounts never take more than the net, so the buyer always pays at least tax, gas and Xao's fee", async function () {
+      const q = await quote($(20), data({ active: false }), [member({ amount: $(20) })]);
+      expect(q.discounts.totalDiscount).to.equal($(17));
+      expect(q.discounts.netAfter).to.equal(0);
+      expect(q.checkoutTotal).to.equal($(3));           // 1.60 + 1 + 0.40
+      expect(q.refundable).to.equal($(2));              // tax and Xao's fee come back, gas does not
+    });
+
+    it("a cheap ticket gives up gas first, then the fee, then the tax", async function () {
+      let b = await m.breakdown($(0.5), 800, 200, $(1));
+      expect([b.gas, b.fee, b.tax, b.net]).to.deep.equal([$(0.5), 0n, 0n, 0n]);
+      b = await m.breakdown($(1.5), 800, 200, $(1));
+      expect([b.gas, b.fee, b.tax, b.net]).to.deep.equal([$(1), $(0.03), $(0.12), $(0.35)]);
+      b = await m.breakdown(0, 800, 200, $(1));
+      expect([b.gas, b.fee, b.tax, b.net]).to.deep.equal([0n, 0n, 0n, 0n]);
+    });
+
+    it("tax and fee are rounded down, never up", async function () {
+      let b = await m.breakdown(49_999n, 0, 200, 0);
+      expect(b.fee).to.equal(999n);                     // 999.98
+      b = await m.breakdown(1_234_567n, 800, 200, $(1));
+      expect(b.tax).to.equal(98_765n);                  // 98,765.36
+      expect(b.fee).to.equal(24_691n);                  // 24,691.34
+    });
+
+    it("rejects a tax or fee above 100%", async function () {
+      await expect(m.breakdown($(20), 10_001, 200, $(1))).to.be.revertedWithCustomError(m, "InvalidBps");
+      await expect(m.breakdown($(20), 800, 10_001, $(1))).to.be.revertedWithCustomError(m, "InvalidBps");
+    });
+
+    it("the four parts always add up to the list price, over 300 random prices", async function () {
+      for (let k = 0; k < 300; k++) {
+        const list = BigInt(rnd(90_000_000)), tax = rnd(2_001), fee = rnd(501), gas = BigInt(rnd(3_000_000));
+        const b = await m.breakdown(list, tax, fee, gas);
+        expect(b.gas + b.fee + b.tax + b.net, `case ${k}`).to.equal(list);
+      }
+    });
+
+    it("random quotes: checkout is the list price less the discounts, and the refund is the checkout less the gas", async function () {
+      for (let k = 0; k < 200; k++) {
+        const list = BigInt(rnd(90_000_000));
+        const members = Array.from({ length: rnd(4) }, (_, i) => member({ priority: i + 1, amount: BigInt(rnd(30_000_000)) }));
+        const q = await quote(list, data({ maxDiscount: BigInt(rnd(5_000_000)), categoryCount: 1, grantedMasks: [1, 1] }), members);
+        expect(q.checkoutTotal, `case ${k}`).to.equal(list - q.discounts.totalDiscount);
+        expect(q.refundable, `case ${k}`).to.equal(q.checkoutTotal - q.parts.gas);
+        expect(q.checkoutTotal, `case ${k}`).to.be.gte(q.parts.tax + q.parts.gas + q.parts.fee);
+        expect(q.discounts.totalDiscount, `case ${k}`).to.be.lte(q.parts.net);
+        expect(q.refundable, `case ${k}`).to.be.gte(q.parts.tax + q.parts.fee);
+      }
     });
   });
 
@@ -292,6 +367,7 @@ describe("DiscountMath", function () {
 
     function randomCase() {
       const list = BigInt(rnd(60_000_000));
+      const net = BigInt(rnd(Number(list) + 1));
       const categories = 1 + rnd(6);
       const funders = rnd(7);
       const d = {
@@ -313,38 +389,38 @@ describe("DiscountMath", function () {
           funderCount: 1 + rnd(4),
         });
       });
-      return { list, d, members };
+      return { list, net, d, members };
     }
 
     it("matches an independent reference and keeps every promise, over 400 random cases", async function () {
       for (let k = 0; k < 400; k++) {
-        const { list, d, members } = randomCase();
-        const r = await run(list, d, members);
-        const ref = reference(list, d, members);
+        const { list, net, d, members } = randomCase();
+        const r = await run(list, d, members, net);
+        const ref = reference(list, net, d, members);
 
         // Same numbers as the reference model.
         expect(r.dataDiscount, `case ${k}`).to.equal(ref.dataDiscount);
         expect(r.memberDiscount, `case ${k}`).to.equal(ref.memberDiscount);
-        expect(r.netPrice, `case ${k}`).to.equal(ref.netPrice);
+        expect(r.netAfter, `case ${k}`).to.equal(ref.netAfter);
         expect([...r.dataDebits], `case ${k}`).to.deep.equal(ref.dataDebits);
         expect([...r.memberApplied], `case ${k}`).to.deep.equal(ref.applied);
         expect(r.memberDebits.map((x) => [...x]), `case ${k}`).to.deep.equal(ref.debits);
 
         // The promises that matter, stated on their own.
-        expect(r.totalDiscount, `case ${k}`).to.be.lte(list);                                  // never below zero
-        expect(r.netPrice + r.totalDiscount, `case ${k}`).to.equal(list);
+        expect(r.totalDiscount, `case ${k}`).to.be.lte(net);                                   // never more than the net
+        expect(r.netAfter + r.totalDiscount, `case ${k}`).to.equal(net);
         expect(sum([...r.dataDebits]), `case ${k}`).to.equal(r.dataDiscount);                   // data debits = data discount
         r.memberApplied.forEach((a, i) => {
           expect(sum([...r.memberDebits[i]]), `case ${k} program ${i}`).to.equal(a);            // every discount is charged in full, to its funders
           if (!members[i].eligible) expect(a, `case ${k} program ${i}`).to.equal(0);           // not eligible, nothing
         });
         // Once the ticket is free, nothing later is applied.
-        if (r.netPrice === 0n) {
+        if (r.netAfter === 0n) {
           let seenFree = false, running = r.dataDiscount;
           r.memberApplied.forEach((a) => {
             if (seenFree) expect(a, `case ${k}`).to.equal(0);
             running += a;
-            if (running === list) seenFree = true;
+            if (running === net) seenFree = true;
           });
         }
       }

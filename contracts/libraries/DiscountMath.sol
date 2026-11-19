@@ -1,23 +1,35 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-/// @title DiscountMath — the arithmetic of ticket discounts (Phase 2F)
-/// @notice Pure integer maths for the Discount Funding & Settlement spec. It
-///         decides how much discount one ticket gets and exactly who is charged
-///         for it. It reads no state and moves no money: the contract that sells
-///         the ticket checks eligibility (membership held, already redeemed,
-///         budget left), passes the answers in, and acts on the result.
+/// @title DiscountMath — the arithmetic of ticket prices and discounts (Phase 2F)
+/// @notice Pure integer maths for ticket pricing and the Discount Funding &
+///         Settlement spec. It reads no state and moves no money: the contract
+///         that sells the ticket checks eligibility (membership held, already
+///         redeemed, budget left), passes the answers in, and acts on the result.
 ///
 ///         All amounts are in the payment token's smallest unit. There is no
-///         floating point and no rounding up beyond what the ticket costs.
+///         floating point.
 ///
-///         Rules this library enforces (spec sections 3, 5):
+///         HOW A TICKET PRICE IS BUILT (client, 2026-11-22)
+///         The organizer sets the ticket's list price, say $20. That is what the
+///         buyer pays, and it holds four parts, all worked out on the LIST price:
+///             sales tax 8%   $1.60
+///             gas            $1.00
+///             Xao fee 2%     $0.40
+///             net            $17.00   (what is left for the organizer)
+///         A discount comes off the NET only. Tax, gas and Xao's fee do not
+///         change, so Xao is never charged for a discount. With a $2 discount the
+///         buyer pays 20 - 2 = $18. If the show is cancelled the buyer gets back
+///         everything but the gas: $17.
+///
+///         HOW DISCOUNTS ARE APPLIED (spec sections 3, 5)
 ///         - All discounts land on ONE ticket (`selectTicket` picks it).
 ///         - The data discount is applied first, then membership programs in
-///           priority order (headliner first). The ticket never goes below zero.
+///           priority order (headliner first). The discounts never take more
+///           than the net, so the net never goes below zero.
 ///         - A discount that does not fully fit is applied partially, up to what
-///           is left. A program passed over because the ticket is already free
-///           applies nothing, so it must not be charged or counted as redeemed.
+///           is left. A program passed over because nothing is left applies
+///           nothing, so it must not be charged or counted as redeemed.
 ///         - Data discount: the program's maximum is cut into one equal cell for
 ///           every (funder, category) pair. The buyer gets the cells they allowed
 ///           and have data for; each cell is charged to its own funder alone.
@@ -30,9 +42,11 @@ pragma solidity ^0.8.20;
 ///         Choices the spec leaves open, made here and easy to change:
 ///         - The ticket picked is the highest priced one (the first on a tie).
 ///         - A percentage discount is a share of the ticket's list price.
-///         - A program's remaining budget limits what it applies, like the price.
-///         - When the data discount is bigger than the ticket price, cells are
-///           used in order until the price is spent.
+///         - A program's remaining budget limits what it applies, like the net.
+///         - When the data discount is bigger than the net, cells are used in
+///           order until the net is spent.
+///         - Tax, fee and gas are rounded down, and squeezed in that order (gas,
+///           then fee, then tax) if a ticket is so cheap they would not fit.
 library DiscountMath {
 
     error TooManyFunders();
@@ -69,24 +83,85 @@ library DiscountMath {
         uint8   funderCount;        // who pays for it, equally
     }
 
+    /// @dev What a list price is made of.
+    struct Breakdown {
+        uint256 listPrice;
+        uint256 gas;
+        uint256 fee;                // Xao's fee
+        uint256 tax;                // sales tax
+        uint256 net;                // list price less gas, fee and tax: what the organizer receives before discounts
+    }
+
     struct Result {
         uint256     listPrice;
+        uint256     netBefore;      // the most that can be discounted
         uint256     dataDiscount;
         uint256     memberDiscount;
         uint256     totalDiscount;
-        uint256     netPrice;       // what the discounted ticket costs; fees are worked out from this
+        uint256     netAfter;       // net after discounts: what reaches the organizer's escrow
         uint256[]   dataDebits;     // per data funder
         uint256[]   memberApplied;  // per program; a program counts as redeemed only if this is above zero
         uint256[][] memberDebits;   // per program, per its funder
     }
 
-    /// @notice Work out the discounts for the one designated ticket.
-    function compute(uint256 listPrice, DataProgram memory data, MemberProgram[] memory members)
+    /// @dev Everything a ticket sale needs: the parts, the discounts, what the
+    ///      buyer pays and what comes back if the show is cancelled.
+    struct Quote {
+        Breakdown parts;
+        Result    discounts;
+        uint256   checkoutTotal;    // what the buyer pays for this ticket
+        uint256   refundable;       // what the buyer gets back on cancellation (everything but the gas)
+    }
+
+    /// @notice Split a list price into gas, Xao's fee, sales tax and net. Each is
+    ///         worked out on the list price and rounded down; if a ticket is too
+    ///         cheap to hold all of them, gas goes first, then the fee, then tax.
+    function breakdown(uint256 listPrice, uint256 taxBps, uint256 feeBps, uint256 gasAllotment)
+        internal pure returns (Breakdown memory b)
+    {
+        if (taxBps > BPS || feeBps > BPS) revert InvalidBps();
+        b.listPrice = listPrice;
+        uint256 left = listPrice;
+
+        b.gas = gasAllotment < left ? gasAllotment : left;
+        left -= b.gas;
+
+        b.fee = listPrice * feeBps / BPS;
+        if (b.fee > left) b.fee = left;
+        left -= b.fee;
+
+        b.tax = listPrice * taxBps / BPS;
+        if (b.tax > left) b.tax = left;
+        left -= b.tax;
+
+        b.net = left;
+    }
+
+    /// @notice Price one ticket: its parts, the discounts, the checkout total
+    ///         and the refundable amount.
+    function quote(
+        uint256 listPrice,
+        uint256 taxBps,
+        uint256 feeBps,
+        uint256 gasAllotment,
+        DataProgram memory data,
+        MemberProgram[] memory members
+    ) internal pure returns (Quote memory q) {
+        q.parts         = breakdown(listPrice, taxBps, feeBps, gasAllotment);
+        q.discounts     = compute(listPrice, q.parts.net, data, members);
+        q.checkoutTotal = listPrice - q.discounts.totalDiscount;
+        q.refundable    = q.checkoutTotal - q.parts.gas;
+    }
+
+    /// @notice Work out the discounts for the one designated ticket. `net` is the
+    ///         most they can add up to; percentages are shares of `listPrice`.
+    function compute(uint256 listPrice, uint256 net, DataProgram memory data, MemberProgram[] memory members)
         internal pure returns (Result memory r)
     {
         if (members.length > MAX_MEMBER_PROGRAMS) revert TooManyPrograms();
         r.listPrice = listPrice;
-        uint256 left = listPrice;
+        r.netBefore = net;
+        uint256 left = net;
 
         // 1. The data discount comes first.
         r.dataDebits = new uint256[](data.grantedMasks.length);
@@ -124,7 +199,7 @@ library DiscountMath {
         }
 
         r.totalDiscount = r.dataDiscount + r.memberDiscount;
-        r.netPrice      = listPrice - r.totalDiscount;
+        r.netAfter      = net - r.totalDiscount;
     }
 
     /// @notice The ticket that carries the discounts: the highest priced, and the
@@ -134,11 +209,6 @@ library DiscountMath {
         for (uint256 i = 1; i < prices.length; i++) {
             if (prices[i] > prices[index]) index = i;
         }
-    }
-
-    /// @notice A percentage fee on the discounted ticket price, rounded down.
-    function feeOnNet(uint256 netPrice, uint256 feeBps) internal pure returns (uint256) {
-        return netPrice * feeBps / BPS;
     }
 
     // ─── INTERNAL ─────────────────────────────────────────────────────────

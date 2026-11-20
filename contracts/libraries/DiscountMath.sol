@@ -10,7 +10,7 @@ pragma solidity ^0.8.20;
 ///         All amounts are in the payment token's smallest unit. There is no
 ///         floating point.
 ///
-///         HOW A TICKET PRICE IS BUILT (client, 2026-11-22)
+///         HOW A TICKET PRICE IS BUILT (client, Nov 2026)
 ///         The organizer sets the ticket's list price, say $20. That is what the
 ///         buyer pays, and it holds four parts, all worked out on the LIST price:
 ///             sales tax 8%   $1.60

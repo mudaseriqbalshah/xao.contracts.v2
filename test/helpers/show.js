@@ -75,7 +75,11 @@ async function deploySystem(tokenName = "MockERC20") {
   );
   await factory.waitForDeployment();
 
-  return { registry, usdc, factory, showImpl, escrowImpl, ticketImpl, validatorImpl };
+  // Shows with discounts clone this; the factory's owner is the first signer.
+  const coordinatorImpl = await (await ethers.getContractFactory("DiscountCoordinator")).deploy();
+  await factory.setDiscountCoordinatorImplementation(coordinatorImpl.target);
+
+  return { registry, usdc, factory, showImpl, escrowImpl, ticketImpl, validatorImpl, coordinatorImpl };
 }
 
 /// Builds a full ShowConfig. `t0` is the reference "now".
@@ -115,6 +119,7 @@ function showConfig(promoter, artist, t0, overrides = {}) {
       totalCapacity: 100,
       salesTaxBPS: 0,
       taxReceiver: ZERO_ADDRESS,
+      discountsEnabled: false,
       compTickets: 5,
       resalePartyABPS: 500,
       resalePartyBBPS: 500,
@@ -187,6 +192,7 @@ async function createShow(factory, creator, cfg) {
     escrow:    await ethers.getContractAt("EventEscrow", a.escrow),
     ticket:    a.ticketContract === ZERO_ADDRESS ? null : await ethers.getContractAt("XAOTicketV2", a.ticketContract),
     validator: a.entryValidator === ZERO_ADDRESS ? null : await ethers.getContractAt("EntryValidator", a.entryValidator),
+    discounts: a.discountCoordinator === ZERO_ADDRESS ? null : await ethers.getContractAt("DiscountCoordinator", a.discountCoordinator),
   };
 }
 

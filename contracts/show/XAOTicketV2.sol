@@ -12,6 +12,7 @@ import "@openzeppelin/contracts/utils/Base64.sol";
 import "../interfaces/IShowBundle.sol";
 import "../libraries/DiscountMath.sol";
 import "../interfaces/IPerkModule.sol";
+import "../interfaces/IDiscountCoordinator.sol";
 
 /// @title XAOTicketV2 — ERC-1155 NFT tickets for one show (Phase 2A)
 /// @notice Sells tickets the same way XAOTicket does: price tiers, lazy mint at
@@ -37,6 +38,9 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
     error InvalidTier();
     error NotOnSaleYet();
     error InvalidGate();
+    error NoDiscountProgram();
+    error InvalidOrder();
+    error PriceAboveMax();
     error NotEligibleForTier();
     error SoldOut();
     error CapacityReached();
@@ -106,10 +110,12 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
         uint16  rescanCount;
         bool    scanned;
         bool    refunded;
-        uint256 pricePaid;      // gross price the buyer paid
+        uint256 pricePaid;      // what the buyer paid for this ticket: its list price less its discounts, gas included
         uint256 escrowed;       // part of it that reached the escrow
         uint256 protocolFee;    // part of `escrowed` held for XAO
         uint256 tax;            // part of `escrowed` held for the tax receiver
+        uint256 listPrice;      // the tier's price when it was bought
+        uint256 discount;       // how much of it a discount took off; above zero marks a discounted ticket
     }
 
     struct TicketInit {
@@ -122,6 +128,7 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
         string      eventName;
         uint256     totalCapacity;
         uint256     salesTaxBPS;    // share of the list price held as sales tax
+        address     discountCoordinator; // the show's discount coordinator, or zero
         TierInput[] tiers;
     }
 
@@ -132,6 +139,7 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
     address public treasury;
     uint256 public totalCapacity;
     uint256 public salesTaxBPS;
+    address public discountCoordinator;
 
     string public eventName;
     string public metadataDNSLink;
@@ -150,6 +158,8 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
     bool public initialized;
 
     // ─── EVENTS ───────────────────────────────────────────────────────────
+    event TicketDiscounted(uint256 indexed tokenId, uint256 listPrice, uint256 discount);
+    event TicketOrder(address indexed buyer, uint256 firstTokenId, uint256 count, uint256 discountTotal);
     event TierGated(uint256 indexed tierId, GateMode mode, address indexed module, uint256 perkId, uint256 presaleFrom);
     event TierAdded(
         uint256 indexed tierId,
@@ -194,6 +204,7 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
         eventName      = init.eventName;
         totalCapacity  = init.totalCapacity;
         salesTaxBPS    = init.salesTaxBPS;
+        discountCoordinator = init.discountCoordinator;
 
         // partyA administers the collection and can grant ADMIN_ROLE to others.
         _grantRole(DEFAULT_ADMIN_ROLE, init.admin);
@@ -287,6 +298,87 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
     {
         // No sales until every party has signed.
         if (!show.isFinalized()) revert ShowNotSigned();
+        uint256 gross = _admit(tierId);
+
+        // Gas, XAO's fee and the sales tax are each a share of the list price, squeezed
+        // in that order if the ticket is too cheap to hold them (see DiscountMath).
+        DiscountMath.Breakdown memory parts = DiscountMath.breakdown(gross, salesTaxBPS, XAO_FEE_BPS, GAS_ALLOTMENT);
+        uint256 escrowed = gross - parts.gas;      // fee and tax stay inside it, so a refund returns them
+
+        tokenId = _record(tierId, gross, parts.gas, parts.fee, parts.tax, 0);
+
+        if (gross > 0) {
+            usdc.safeTransferFrom(msg.sender, address(this), gross);
+            if (parts.gas > 0) usdc.safeTransfer(treasury, parts.gas);
+            if (escrowed > 0) usdc.safeTransfer(escrow, escrowed);
+        }
+        // Always reported, so the escrow rejects sales it is not open for.
+        IEventEscrowLike(escrow).creditTicketSale(escrowed, parts.fee, parts.tax);
+
+        _mint(msg.sender, tokenId, 1, "");
+
+        emit TicketSold(tokenId, tierId, msg.sender, gross);
+    }
+
+    /// @notice Buy several tickets in one order, with the show's discounts. Every
+    ///         discount goes to one eligible ticket of the order, chosen by the
+    ///         contract; `expectedHash` is the hash of the quote the buyer saw (see
+    ///         `quoteTickets`), so a sale whose price changed in the meantime is
+    ///         refused, and `maxTotal` is the most the buyer will pay for the order.
+    ///         The buyer pays each ticket's list price less its discounts; gas, Xao's
+    ///         fee and the tax are the same as without a discount. Every ticket is
+    ///         recorded with what was actually paid for it, so a cancelled show
+    ///         refunds exactly that. Tickets bought with `buyTicket` get no discount.
+    function buyTickets(
+        uint256[] calldata tierIds,
+        IDiscountCoordinator.Consent calldata consent,
+        bytes32 expectedHash,
+        uint256 maxTotal
+    ) external nonReentrant whenNotPaused returns (uint256[] memory tokenIds) {
+        address coordinator = discountCoordinator;
+        if (coordinator == address(0)) revert NoDiscountProgram();
+        if (!show.isFinalized()) revert ShowNotSigned();
+        uint256 n = tierIds.length;
+        if (n == 0 || n > DiscountMath.MAX_ORDER_ITEMS) revert InvalidOrder();
+
+        uint256[] memory prices = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) prices[i] = _admit(tierIds[i]);
+
+        IDiscountCoordinator.Sale memory sale = IDiscountCoordinator(coordinator).commit(
+            msg.sender, tierIds, prices, salesTaxBPS, XAO_FEE_BPS, GAS_ALLOTMENT, consent, expectedHash
+        );
+        if (sale.checkoutTotal > maxTotal) revert PriceAboveMax();
+
+        tokenIds = new uint256[](n);
+        uint256 gasTotal;
+        uint256 escrowTotal;
+        uint256 feeTotal;
+        uint256 taxTotal;
+        for (uint256 i = 0; i < n; i++) {
+            tokenIds[i] = _record(tierIds[i], prices[i], sale.gas[i], sale.fee[i], sale.tax[i], prices[i] - sale.pricePaid[i]);
+            gasTotal    += sale.gas[i];
+            escrowTotal += sale.pricePaid[i] - sale.gas[i];
+            feeTotal    += sale.fee[i];
+            taxTotal    += sale.tax[i];
+        }
+
+        if (sale.checkoutTotal > 0) {
+            usdc.safeTransferFrom(msg.sender, address(this), sale.checkoutTotal);
+            if (gasTotal > 0) usdc.safeTransfer(treasury, gasTotal);
+            if (escrowTotal > 0) usdc.safeTransfer(escrow, escrowTotal);
+        }
+        IEventEscrowLike(escrow).creditTicketSale(escrowTotal, feeTotal, taxTotal);
+
+        for (uint256 i = 0; i < n; i++) {
+            _mint(msg.sender, tokenIds[i], 1, "");
+            emit TicketSold(tokenIds[i], tierIds[i], msg.sender, sale.pricePaid[i]);
+            if (sale.pricePaid[i] < prices[i]) emit TicketDiscounted(tokenIds[i], prices[i], prices[i] - sale.pricePaid[i]);
+        }
+        emit TicketOrder(msg.sender, tokenIds[0], n, sale.discountTotal);
+    }
+
+    /// @dev Checks that a ticket of this tier can be bought now and takes a seat from it.
+    function _admit(uint256 tierId) internal returns (uint256 listPrice) {
         if (tierId >= tierCount) revert InvalidTier();
         TicketTier storage tier = tiers[tierId];
         if (tier.gateMode == GateMode.MEMBERS_ONLY && !_gatePasses(tier)) revert NotEligibleForTier();
@@ -297,44 +389,31 @@ contract XAOTicketV2 is ERC1155, ERC2981, AccessControl, ReentrancyGuard, Pausab
         }
         if (tier.sold >= tier.quantity) revert SoldOut();
         if (totalSold >= totalCapacity) revert CapacityReached();
-
-        uint256 gross = tier.priceUSDC;
-
-        // Gas, XAO's fee and the sales tax are each a share of the list price, squeezed
-        // in that order if the ticket is too cheap to hold them (see DiscountMath).
-        DiscountMath.Breakdown memory parts = DiscountMath.breakdown(gross, salesTaxBPS, XAO_FEE_BPS, GAS_ALLOTMENT);
-        uint256 gasFee      = parts.gas;
-        uint256 escrowed    = gross - gasFee;      // fee and tax stay inside it, so a refund returns them
-        uint256 protocolFee = parts.fee;
-        uint256 tax         = parts.tax;
-
-        tokenId = ++lastMintedId;
-        tokenToTier[tokenId] = tierId;
         tier.sold++;
         totalSold++;
+        listPrice = tier.priceUSDC;
+    }
+
+    /// @dev Writes down a ticket and what was paid for it. The token itself is minted by the caller, last.
+    function _record(uint256 tierId, uint256 listPrice, uint256 gas, uint256 fee, uint256 tax, uint256 discount)
+        internal returns (uint256 tokenId)
+    {
+        tokenId = ++lastMintedId;
+        tokenToTier[tokenId] = tierId;
+        uint256 paid = listPrice - discount;
         ticketData[tokenId] = TicketData({
             mintTime:    uint64(block.timestamp),
             scanTime:    0,
             rescanCount: 0,
             scanned:     false,
             refunded:    false,
-            pricePaid:   gross,
-            escrowed:    escrowed,
-            protocolFee: protocolFee,
-            tax:         tax
+            pricePaid:   paid,
+            escrowed:    paid - gas,
+            protocolFee: fee,
+            tax:         tax,
+            listPrice:   listPrice,
+            discount:    discount
         });
-
-        if (gross > 0) {
-            usdc.safeTransferFrom(msg.sender, address(this), gross);
-            if (gasFee > 0) usdc.safeTransfer(treasury, gasFee);
-            if (escrowed > 0) usdc.safeTransfer(escrow, escrowed);
-        }
-        // Always reported, so the escrow rejects sales it is not open for.
-        IEventEscrowLike(escrow).creditTicketSale(escrowed, protocolFee, tax);
-
-        _mint(msg.sender, tokenId, 1, "");
-
-        emit TicketSold(tokenId, tierId, msg.sender, gross);
     }
 
     // ─── SCANNING (entry validator only) ─────────────────────────────────

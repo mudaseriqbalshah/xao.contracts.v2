@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import "../interfaces/IShowBundle.sol";
 import "../interfaces/IFanMembership.sol";
 import "../interfaces/IMiniOrg.sol";
+import "../interfaces/IDiscountCoordinator.sol";
 import "../libraries/DiscountMath.sol";
 import "../libraries/XaoRoles.sol";
 
@@ -39,7 +40,7 @@ import "../libraries/XaoRoles.sol";
 ///         and report release (data module), and checking that a funder's payout
 ///         can actually bear its debts (escrow settlement).
 /// @dev Deployed as a minimal-proxy clone by DiscountCoordinatorFactory.
-contract DiscountCoordinator {
+contract DiscountCoordinator is IDiscountCoordinator {
 
     error AlreadyInitialized();
     error ZeroAddress();
@@ -114,13 +115,6 @@ contract DiscountCoordinator {
         uint32  categoryMask;       // DATA: the categories this funder may receive
         uint256 maxDebit;           // the most it may be charged in this program
         uint256 debited;            // what it has been charged
-    }
-
-    /// @dev What the buyer chose to share. Empty `grantedMasks` means the buyer declined.
-    struct Consent {
-        uint32   availableMask;     // the categories the buyer has data for
-        uint32[] grantedMasks;      // one per data funder, in roster order: categories shared with that funder
-        bytes32  commitment;        // a commitment to the buyer's consent, kept for the data module
     }
 
     uint256 public constant MAX_PROGRAMS = 17;          // one data program and sixteen membership programs
@@ -293,7 +287,7 @@ contract DiscountCoordinator {
         uint256 feeBps,
         uint256 gasAllotment,
         Consent calldata consent
-    ) public view returns (DiscountMath.OrderQuote memory q, bytes32 quoteHash) {
+    ) public view override returns (DiscountMath.OrderQuote memory q, bytes32 quoteHash) {
         (DiscountMath.DataOffer memory data, DiscountMath.MemberOffer[] memory members, ) = _offers(wallet, consent);
         q = DiscountMath.quoteOrder(typeIds, listPrices, taxBps, feeBps, gasAllotment, data, members);
         quoteHash = keccak256(abi.encode(wallet, typeIds, listPrices, q.discounts.itemDiscount, q.discounts.dataDebits, q.discounts.memberApplied, q.discounts.memberItem));
@@ -312,12 +306,12 @@ contract DiscountCoordinator {
         uint256 gasAllotment,
         Consent calldata consent,
         bytes32 expectedHash
-    ) external returns (DiscountMath.OrderQuote memory q) {
+    ) external override returns (Sale memory sale) {
         if (msg.sender != ticketContract) revert NotTicketContract();
         if (!show.isFinalized()) revert ShowNotSigned();
 
         (DiscountMath.DataOffer memory data, DiscountMath.MemberOffer[] memory members, uint256[] memory ids) = _offers(wallet, consent);
-        q = DiscountMath.quoteOrder(typeIds, listPrices, taxBps, feeBps, gasAllotment, data, members);
+        DiscountMath.OrderQuote memory q = DiscountMath.quoteOrder(typeIds, listPrices, taxBps, feeBps, gasAllotment, data, members);
         bytes32 h = keccak256(abi.encode(wallet, typeIds, listPrices, q.discounts.itemDiscount, q.discounts.dataDebits, q.discounts.memberApplied, q.discounts.memberItem));
         if (h != expectedHash) revert QuoteChanged();
 
@@ -329,6 +323,19 @@ contract DiscountCoordinator {
         for (uint256 i = 0; i < ids.length; i++) {
             if (r.memberApplied[i] > 0) _recordMember(wallet, ids[i], i, r);
         }
+
+        uint256 n = listPrices.length;
+        sale.pricePaid     = q.pricePaid;
+        sale.gas           = new uint256[](n);
+        sale.fee           = new uint256[](n);
+        sale.tax           = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) {
+            sale.gas[i] = q.parts[i].gas;
+            sale.fee[i] = q.parts[i].fee;
+            sale.tax[i] = q.parts[i].tax;
+        }
+        sale.checkoutTotal = q.checkoutTotal;
+        sale.discountTotal = r.totalDiscount;
     }
 
     // ─── VIEWS ────────────────────────────────────────────────────────────

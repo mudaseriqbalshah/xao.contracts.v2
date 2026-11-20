@@ -8,6 +8,7 @@ import "./ShowInstance.sol";
 import "./EventEscrow.sol";
 import "./XAOTicketV2.sol";
 import "./EntryValidator.sol";
+import "../discounts/DiscountCoordinator.sol";
 
 /// @title ShowFactory — deploy and wire one show bundle per show (Phase 2A)
 /// @notice One call turns the create-show form into a ShowInstance, its
@@ -22,6 +23,8 @@ contract ShowFactory is Ownable {
     error ArbitrationNotAvailable();
     error BackendMismatch();
     error InvalidSalesTax();
+    error DiscountsNeedTickets();
+    error DiscountsNotAvailable();
     error InvalidTaxReceiver();
 
     struct ShowConfig {
@@ -54,6 +57,7 @@ contract ShowFactory is Ownable {
         address escrow;
         address ticketContract;     // 0 if tickets are disabled
         address entryValidator;     // 0 if tickets are disabled
+        address discountCoordinator; // 0 unless the show has discounts
     }
 
     // ─── PROTOCOL REFERENCES (owner-managed) ──────────────────────────────
@@ -67,6 +71,7 @@ contract ShowFactory is Ownable {
     address public eventEscrowImpl;
     address public ticketImpl;
     address public validatorImpl;
+    address public discountCoordinatorImpl;     // the implementation shows with discounts clone; zero until set
 
     // ─── REGISTRY OF SHOWS ────────────────────────────────────────────────
     address[] public allShows;
@@ -88,8 +93,10 @@ contract ShowFactory is Ownable {
         address entryValidator,
         bool ticketsEnabled,
         bool arbitrationEnabled,
-        string showMetaCID
+        string showMetaCID,
+        address discountCoordinator
     );
+    event DiscountCoordinatorImplementationSet(address implementation);
     event ImplementationsSet(address showInstance, address eventEscrow, address ticket, address validator);
     event GraphRegistrySet(address graphRegistry);
     event ArbitrationAgentSet(address arbitrationAgent);
@@ -123,6 +130,7 @@ contract ShowFactory is Ownable {
         if (cfg.arbitrationEnabled && arbitrationAgent == address(0)) revert ArbitrationNotAvailable();
         _requireBackendMatchesSweep(cfg);
         _requireValidTax(cfg);
+        _requireValidDiscounts(cfg);
 
         bytes32 showId = _showIdFor(msg.sender, cfg);
 
@@ -171,6 +179,9 @@ contract ShowFactory is Ownable {
         if (cfg.tickets.ticketsEnabled) {
             bundle.ticketContract = Clones.cloneDeterministic(ticketImpl, _salt("TICKET", showId));
             bundle.entryValidator = Clones.cloneDeterministic(validatorImpl, _salt("VALIDATOR", showId));
+            if (cfg.tickets.discountsEnabled) {
+                bundle.discountCoordinator = Clones.cloneDeterministic(discountCoordinatorImpl, _salt("DISCOUNTS", showId));
+            }
 
             XAOTicketV2(bundle.ticketContract).initialize(
                 XAOTicketV2.TicketInit({
@@ -183,6 +194,7 @@ contract ShowFactory is Ownable {
                     eventName:      cfg.promo.eventName,
                     totalCapacity:  cfg.tickets.totalCapacity,
                     salesTaxBPS:    cfg.tickets.salesTaxBPS,
+                    discountCoordinator: bundle.discountCoordinator,
                     tiers:          cfg.tiers
                 })
             );
@@ -196,6 +208,10 @@ contract ShowFactory is Ownable {
                 cfg.partyA.wallet
             );
 
+            if (bundle.discountCoordinator != address(0)) {
+                DiscountCoordinator(bundle.discountCoordinator).initialize(bundle.showInstance, bundle.ticketContract);
+            }
+
             EventEscrow(bundle.escrow).setTicketContract(bundle.ticketContract);
             ShowInstance(bundle.showInstance).setTicketingModule(bundle.ticketContract, bundle.entryValidator);
         }
@@ -206,6 +222,7 @@ contract ShowFactory is Ownable {
             _registerModule(bundle.showInstance, bundle.ticketContract);
             _registerModule(bundle.showInstance, bundle.entryValidator);
         }
+        if (bundle.discountCoordinator != address(0)) _registerModule(bundle.showInstance, bundle.discountCoordinator);
 
         // 5. Bookkeeping
         allShows.push(bundle.showInstance);
@@ -226,7 +243,8 @@ contract ShowFactory is Ownable {
             bundle.entryValidator,
             cfg.tickets.ticketsEnabled,
             cfg.arbitrationEnabled,
-            cfg.anchors.showMetaCID
+            cfg.anchors.showMetaCID,
+            bundle.discountCoordinator
         );
     }
 
@@ -246,6 +264,9 @@ contract ShowFactory is Ownable {
         bundle.escrow         = Clones.predictDeterministicAddress(eventEscrowImpl, _salt("ESCROW", showId));
         bundle.ticketContract = Clones.predictDeterministicAddress(ticketImpl, _salt("TICKET", showId));
         bundle.entryValidator = Clones.predictDeterministicAddress(validatorImpl, _salt("VALIDATOR", showId));
+        if (discountCoordinatorImpl != address(0)) {
+            bundle.discountCoordinator = Clones.predictDeterministicAddress(discountCoordinatorImpl, _salt("DISCOUNTS", showId));
+        }
     }
 
     /// @notice The show id `creator` would get for this config. It always
@@ -265,6 +286,13 @@ contract ShowFactory is Ownable {
         address _validatorImpl
     ) external onlyOwner {
         _setImplementations(_showInstanceImpl, _eventEscrowImpl, _ticketImpl, _validatorImpl);
+    }
+
+    /// @notice The implementation that shows with discounts clone. Applies to shows created afterwards.
+    function setDiscountCoordinatorImplementation(address implementation) external onlyOwner {
+        if (implementation == address(0)) revert ZeroAddress();
+        discountCoordinatorImpl = implementation;
+        emit DiscountCoordinatorImplementationSet(implementation);
     }
 
     function setGraphRegistry(address _graphRegistry) external onlyOwner {
@@ -319,6 +347,13 @@ contract ShowFactory is Ownable {
     ///      number and pay another. Others (an agent, a promoter) may take their
     ///      own cut of the sweep; only partyB's share is compared. A show with no
     ///      partyB has no backend to check.
+    /// @dev A show with discounts needs tickets, and an implementation to clone.
+    function _requireValidDiscounts(ShowConfig calldata cfg) internal view {
+        if (!cfg.tickets.discountsEnabled) return;
+        if (!cfg.tickets.ticketsEnabled) revert DiscountsNeedTickets();
+        if (discountCoordinatorImpl == address(0)) revert DiscountsNotAvailable();
+    }
+
     /// @dev Sales tax needs someone to pay it to the government: partyA or partyB.
     function _requireValidTax(ShowConfig calldata cfg) internal pure {
         if (!cfg.tickets.ticketsEnabled || cfg.tickets.salesTaxBPS == 0) return;

@@ -178,6 +178,7 @@ function buildConfig(o) {
       totalCapacity: 100,
       salesTaxBPS: 0,
       taxReceiver: "0x0000000000000000000000000000000000000000",
+      discountsEnabled: false,
       compTickets: 0,
       resalePartyABPS: 500,
       resalePartyBBPS: 500,

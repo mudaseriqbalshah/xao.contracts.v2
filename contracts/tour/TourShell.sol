@@ -7,6 +7,11 @@ import "../interfaces/IGraphAuthorizer.sol";
 import "../interfaces/IGraphRegistry.sol";
 import "./TourParticipationAgreement.sol";
 
+/// @dev What the shell asks a settlement escrow before it points to it.
+interface ISettlementModuleShell {
+    function tourShell() external view returns (address);
+}
+
 /// @title TourShell — single-party root container for a tour (Phase 2A)
 /// @notice Anchors tour identity and metadata, manages operators, creates
 ///         Tour Participation Agreements and starts the linking of shows under
@@ -21,6 +26,8 @@ contract TourShell is IGraphParties, IGraphAuthorizer {
     error UnknownTPA();
     error TPAAlreadyRegistered();
     error TPANotForThisShell();
+    error SettlementModuleAlreadySet();
+    error SettlementModuleNotForThisShell();
 
     struct TPAConfig {
         address partyB;          // participant
@@ -45,12 +52,17 @@ contract TourShell is IGraphParties, IGraphAuthorizer {
     mapping(address => bool) public isTPA;
     address[] private _tpas;
 
+    /// @notice The tour's settlement escrow, where band pay is worked out and paid. The shell
+    ///         only points to it: it still never holds or distributes money.
+    address public tourSettlementEscrow;
+
     bool public initialized;
 
     event TourShellInitialized(address indexed owner, bytes32 indexed tourId, string tourMetaCID, bytes32 tourMetaHash);
     event OperatorSet(address indexed op, bool allowed);
     event TPACreated(address indexed tpa, address indexed partyB, bytes32 termsHash, string termsCID);
     event TPARegistered(address indexed tpa);
+    event SettlementModuleRegistered(address indexed module);
     event ShowLinkedPending(address indexed tpa, address indexed eventRoot, bytes32 edgeIdParents, bytes32 edgeIdChildOf);
 
     modifier onlyOwner() {
@@ -166,6 +178,15 @@ contract TourShell is IGraphParties, IGraphAuthorizer {
         edgeIdChildOf = registry.registerEdge(eventRoot, tpa, IGraphRegistry.EdgeType.CHILD_OF, metaHash, metaCID);
 
         emit ShowLinkedPending(tpa, eventRoot, edgeIdParents, edgeIdChildOf);
+    }
+
+    /// @notice Point the tour at its settlement escrow. Once, by the owner; the escrow has to name this shell.
+    function registerSettlementModule(address module) external onlyOwner {
+        if (tourSettlementEscrow != address(0)) revert SettlementModuleAlreadySet();
+        if (module == address(0)) revert ZeroAddress();
+        if (ISettlementModuleShell(module).tourShell() != address(this)) revert SettlementModuleNotForThisShell();
+        tourSettlementEscrow = module;
+        emit SettlementModuleRegistered(module);
     }
 
     // ─── VIEWS ────────────────────────────────────────────────────────────

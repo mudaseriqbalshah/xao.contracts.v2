@@ -210,6 +210,7 @@ contract ShowFactory is Ownable {
 
             if (bundle.discountCoordinator != address(0)) {
                 DiscountCoordinator(bundle.discountCoordinator).initialize(bundle.showInstance, bundle.ticketContract);
+                EventEscrow(bundle.escrow).setDiscountLedger(bundle.discountCoordinator);
             }
 
             EventEscrow(bundle.escrow).setTicketContract(bundle.ticketContract);

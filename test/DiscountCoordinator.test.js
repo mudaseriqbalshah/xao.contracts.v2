@@ -21,6 +21,13 @@ describe("DiscountCoordinator", function () {
   let promoter, artist, fan, fan2, bandA, bandB, ticket, stranger;
   let t0;
 
+  // The show pays both bands a share of the final sweep, so either can fund a discount.
+  const SWEEP = () => ({
+    recipients: [promoter.address, artist.address, bandA.address, bandB.address],
+    bps: [3000, 5000, 1000, 1000],
+    notBefore: t0 + 30 * 86_400 + 7_200,
+  });
+
   const dataCfg = (o = {}) => ({ maxDiscount: $(1), categoryCount: 2, allowedTypeMask: mask(GA, VIP), budget: 0, redemptionCap: 0, effectiveFrom: 0, effectiveTo: 0, ...o });
   const memberCfg = (o = {}) => ({
     membership: membership.target, minTierPriority: 0, isPercent: false, amount: $(5), priority: 1,
@@ -50,7 +57,7 @@ describe("DiscountCoordinator", function () {
     sys = await deploySystem();
     t0 = await time.latest();
     bundle = await createShow(sys.factory, promoter, showConfig(promoter, artist, t0, {
-      anchors: { termsHash: ethers.id("coordinator-show") }, funding: [],
+      anchors: { termsHash: ethers.id("coordinator-show") }, funding: [], sweep: SWEEP(),
       tiers: [tier({ quantity: 100, priceUSDC: $(20) }), tier({ quantity: 100, priceUSDC: $(50), ticketType: 3 })],
     }));
 
@@ -176,9 +183,20 @@ describe("DiscountCoordinator", function () {
       const wImpl = await (await ethers.getContractFactory("MiniOrgWallet")).deploy();
       const gImpl = await (await ethers.getContractFactory("MiniOrgGrant")).deploy();
       const of = await (await ethers.getContractFactory("MiniOrgFactory")).deploy(wImpl.target, gImpl.target, sys.registry.target);
-      const made = await (await of.connect(owner).createMiniOrg(ethers.id("band"), ZERO_ADDRESS, [owner.address], ZERO_BYTES32, "")).wait();
+      const salt = ethers.id("band");
+      const orgAddress = await of.predictMiniOrg(owner.address, salt);       // known before it exists, so the show can pay it
+
+      const b = await createShow(sys.factory, promoter, showConfig(promoter, artist, t0, {
+        anchors: { termsHash: ethers.id("org-funder") }, funding: [], tiers: [tier({ quantity: 10 })],
+        sweep: { recipients: [promoter.address, artist.address, orgAddress], bps: [3000, 5000, 2000], notBefore: t0 + 30 * 86_400 + 7_200 },
+      }));
+      await coordFactory.connect(promoter).createCoordinator(b.show.target, ticket.address);
+      const c = await ethers.getContractAt("DiscountCoordinator", await coordFactory.coordinatorOf(b.show.target));
+
+      const made = await (await of.connect(owner).createMiniOrg(salt, ZERO_ADDRESS, [owner.address], ZERO_BYTES32, "")).wait();
       const parse = (r, n) => of.interface.parseLog(r.logs.find((l) => l.address === of.target && of.interface.parseLog(l)?.name === n));
       const org = await ethers.getContractAt("MiniOrgWallet", parse(made, "MiniOrgCreated").args.org);
+      expect(org.target).to.equal(orgAddress);
       const attach = async (type, user, role) => {
         const rr = await (await of.connect(owner).createGrant(org.target, type, 0, 0, ZERO_BYTES32, "", [{ user: user.address, role, expiresAt: 0 }])).wait();
         await org.connect(owner).addGrant(parse(rr, "GrantCreated").args.grant);
@@ -187,14 +205,14 @@ describe("DiscountCoordinator", function () {
       await attach(GRANT.OPERATOR, operator, ROLE.OPERATOR);
       await attach(GRANT.OWNER, owner, ROLE.OWNER);
 
-      const id = await addMember();
-      await coord.connect(promoter).proposeFunder(id, org.target, 0);
-      await expect(coord.connect(operator).authorizeFunding(id, $(10))).to.be.revertedWithCustomError(coord, "NotFunderSigner");
-      await expect(coord.connect(stranger).authorizeFunding(id, $(10))).to.be.revertedWithCustomError(coord, "NotFunderSigner");
-      await coord.connect(admin).authorizeFunding(id, $(10));
-      expect((await coord.getFunderAuth(id, org.target)).authorized).to.equal(true);
-      await coord.connect(owner).authorizeFunding(id, $(20));
-      expect((await coord.getFunderAuth(id, org.target)).maxDebit).to.equal($(20));
+      await c.connect(promoter).configureMembershipProgram(memberCfg());
+      await c.connect(promoter).proposeFunder(1, org.target, 0);
+      await expect(c.connect(operator).authorizeFunding(1, $(10))).to.be.revertedWithCustomError(c, "NotFunderSigner");
+      await expect(c.connect(stranger).authorizeFunding(1, $(10))).to.be.revertedWithCustomError(c, "NotFunderSigner");
+      await c.connect(admin).authorizeFunding(1, $(10));
+      expect((await c.getFunderAuth(1, org.target)).authorized).to.equal(true);
+      await c.connect(owner).authorizeFunding(1, $(20));
+      expect((await c.getFunderAuth(1, org.target)).maxDebit).to.equal($(20));
     });
   });
 
@@ -236,7 +254,7 @@ describe("DiscountCoordinator", function () {
       const timed = await (async () => {
         // a new coordinator, since this show is already signed
         const b = await createShow(sys.factory, promoter, showConfig(promoter, artist, t0, {
-          anchors: { termsHash: ethers.id("timed") }, funding: [], tiers: [tier({ quantity: 10 })],
+          anchors: { termsHash: ethers.id("timed") }, funding: [], sweep: SWEEP(), tiers: [tier({ quantity: 10 })],
         }));
         await coordFactory.connect(promoter).createCoordinator(b.show.target, ticket.address);
         const c = await ethers.getContractAt("DiscountCoordinator", await coordFactory.coordinatorOf(b.show.target));
@@ -410,7 +428,7 @@ describe("DiscountCoordinator", function () {
 
     it("never gives a funder more than the categories it was listed for", async function () {
       const b = await createShow(sys.factory, promoter, showConfig(promoter, artist, t0, {
-        anchors: { termsHash: ethers.id("masks") }, funding: [], tiers: [tier({ quantity: 10 })],
+        anchors: { termsHash: ethers.id("masks") }, funding: [], sweep: SWEEP(), tiers: [tier({ quantity: 10 })],
       }));
       await coordFactory.connect(promoter).createCoordinator(b.show.target, ticket.address);
       const c = await ethers.getContractAt("DiscountCoordinator", await coordFactory.coordinatorOf(b.show.target));
@@ -445,7 +463,7 @@ describe("DiscountCoordinator", function () {
 
     it("skips a funder that may no longer be charged, and never overdraws it", async function () {
       const b = await createShow(sys.factory, promoter, showConfig(promoter, artist, t0, {
-        anchors: { termsHash: ethers.id("room") }, funding: [], tiers: [tier({ quantity: 10 })],
+        anchors: { termsHash: ethers.id("room") }, funding: [], sweep: SWEEP(), tiers: [tier({ quantity: 10 })],
       }));
       await coordFactory.connect(promoter).createCoordinator(b.show.target, ticket.address);
       const c = await ethers.getContractAt("DiscountCoordinator", await coordFactory.coordinatorOf(b.show.target));
@@ -462,7 +480,7 @@ describe("DiscountCoordinator", function () {
 
     it("has a total budget and a limit on buyers", async function () {
       const b = await createShow(sys.factory, promoter, showConfig(promoter, artist, t0, {
-        anchors: { termsHash: ethers.id("data-caps") }, funding: [], tiers: [tier({ quantity: 10 })],
+        anchors: { termsHash: ethers.id("data-caps") }, funding: [], sweep: SWEEP(), tiers: [tier({ quantity: 10 })],
       }));
       await coordFactory.connect(promoter).createCoordinator(b.show.target, ticket.address);
       const c = await ethers.getContractAt("DiscountCoordinator", await coordFactory.coordinatorOf(b.show.target));
@@ -485,7 +503,7 @@ describe("DiscountCoordinator", function () {
 
     it("comes first, ahead of a membership benefit", async function () {
       const bs = await createShow(sys.factory, promoter, showConfig(promoter, artist, t0, {
-        anchors: { termsHash: ethers.id("both") }, funding: [], tiers: [tier({ quantity: 10 })],
+        anchors: { termsHash: ethers.id("both") }, funding: [], sweep: SWEEP(), tiers: [tier({ quantity: 10 })],
       }));
       await coordFactory.connect(promoter).createCoordinator(bs.show.target, ticket.address);
       const c = await ethers.getContractAt("DiscountCoordinator", await coordFactory.coordinatorOf(bs.show.target));
@@ -550,7 +568,7 @@ describe("DiscountCoordinator", function () {
 
     it("what funders owe always adds up to what buyers were given, and nobody goes over their cap", async function () {
       const bs = await createShow(sys.factory, promoter, showConfig(promoter, artist, t0, {
-        anchors: { termsHash: ethers.id("conservation") }, funding: [],
+        anchors: { termsHash: ethers.id("conservation") }, funding: [], sweep: SWEEP(),
         tiers: [tier({ quantity: 100, priceUSDC: $(20) }), tier({ quantity: 100, priceUSDC: $(50), ticketType: 3 })],
       }));
       await coordFactory.connect(promoter).createCoordinator(bs.show.target, ticket.address);

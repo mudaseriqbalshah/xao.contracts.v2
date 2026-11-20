@@ -49,6 +49,7 @@ describe("Buying tickets with discounts", function () {
       anchors: { termsHash: ethers.id(name) }, funding: [],
       tiers: tiers ?? [tier({ quantity: 100, priceUSDC: $(20) }), tier({ quantity: 100, priceUSDC: $(50), ticketType: 3 })],
       tickets: { discountsEnabled: true, salesTaxBPS: TAX, taxReceiver: promoter.address, ...tickets },
+      sweep: { recipients: [promoter.address, artist.address, bandA.address, bandB.address], bps: [3000, 5000, 1000, 1000], notBefore: showEnd },
       ...rest,
     }));
     let id = 0;

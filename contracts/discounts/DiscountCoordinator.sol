@@ -5,6 +5,7 @@ import "../interfaces/IShowBundle.sol";
 import "../interfaces/IFanMembership.sol";
 import "../interfaces/IMiniOrg.sol";
 import "../interfaces/IDiscountCoordinator.sol";
+import "../interfaces/IDebtSettlement.sol";
 import "../libraries/DiscountMath.sol";
 import "../libraries/XaoRoles.sol";
 
@@ -46,6 +47,8 @@ contract DiscountCoordinator is IDiscountCoordinator {
     error ZeroAddress();
     error NotShowSide();
     error NotFunderSigner();
+    error FunderNotPaidByShow();
+    error CapAboveGuarantee();
     error NotTicketContract();
     error ShowAlreadySigned();
     error ShowNotSigned();
@@ -136,6 +139,7 @@ contract DiscountCoordinator is IDiscountCoordinator {
     mapping(address => bool) public dataClaimed;                      // wallet
     mapping(address => bytes32) public dataCommitment;                // wallet => its consent commitment
     mapping(address => uint256) public funderDebit;                   // everything a funder owes, over all programs
+    mapping(address => uint256) public authorizedTotal;               // the caps a funder has authorized, over all programs
     uint256 public totalDebit;
 
     // ─── EVENTS ───────────────────────────────────────────────────────────
@@ -251,6 +255,12 @@ contract DiscountCoordinator is IDiscountCoordinator {
         if (maxDebit == 0) revert ZeroCap();
         address funder = _funderFor(programId, msg.sender);
         FunderAuth storage a = _auth[programId][funder];
+
+        // The show has to be able to collect what a funder owes from what it pays that funder.
+        uint256 total = authorizedTotal[funder] - a.maxDebit + maxDebit;
+        _requireRoute(funder, total);
+        authorizedTotal[funder] = total;
+
         a.authorized = true;
         a.maxDebit   = maxDebit;
         emit FundingAuthorized(programId, funder, maxDebit);
@@ -517,6 +527,16 @@ contract DiscountCoordinator is IDiscountCoordinator {
     function _holdsMembership(address program, address wallet, uint32 minPriority) internal view returns (bool) {
         (bool ok, bytes memory data) = program.staticcall(abi.encodeCall(IFanMembership.hasActiveTier, (wallet, minPriority)));
         return ok && data.length >= 32 && uint256(bytes32(data)) != 0;
+    }
+
+    /// @dev A funder is charged by taking it from its payout. If the show only pays it fixed
+    ///      amounts, its caps together cannot be more than those; if it also has a share of
+    ///      the final sweep, its debts come out of that share too.
+    function _requireRoute(address funder, uint256 totalCaps) internal view {
+        (uint256 fixedAmount, bool hasSweepShare) = IDebtRoute(show.escrow()).debtRoute(funder);
+        if (hasSweepShare) return;
+        if (fixedAmount == 0) revert FunderNotPaidByShow();
+        if (totalCaps > fixedAmount) revert CapAboveGuarantee();
     }
 
     function _requireShowSide() internal view {

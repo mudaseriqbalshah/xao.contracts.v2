@@ -5,6 +5,7 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "../interfaces/IShowBundle.sol";
 import "../interfaces/IEarnings.sol";
+import "../interfaces/IDebtSettlement.sol";
 
 /// @title EventEscrow — custody and payout engine for one show (Phase 2A)
 /// @notice Holds every dollar tied to a show: party deposits and ticket
@@ -21,6 +22,7 @@ import "../interfaces/IEarnings.sol";
 contract EventEscrow is IEarningsSource, ReentrancyGuard {
 
     error AlreadyInitialized();
+    error LedgerAlreadySet();
     error NotFactory();
     error NotAParty();
     error NotTicketContract();
@@ -163,6 +165,11 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
     /// @notice XAO's share of ticket sales, held until the show completes.
     uint256 public protocolFeeAccrued;
 
+    /// @notice The show's discount coordinator, which knows what each discount funder owes.
+    address public discountLedger;
+    /// @notice What has been taken from each funder's payout for discounts it funded.
+    mapping(address => uint256) public debtApplied;
+
     /// @notice Sales tax collected with ticket sales, held until the show is completed (paid to
     ///         `taxReceiver`) or the tickets are refunded. It is never available for payouts.
     address public taxReceiver;
@@ -217,6 +224,7 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
     event PayoutSkipped(uint256 indexed ruleIndex, uint256 required, uint256 available);
     event ProtocolFeePaid(uint256 amount);
     event TaxHeld(uint256 amount);
+    event DebtApplied(address indexed funder, uint256 amount);
     event TaxPaid(address indexed to, uint256 amount);
     event FinalSweepExecuted(uint256 amount);
     event EscrowCompleted();
@@ -346,6 +354,44 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
         ticketContract = _ticketContract;
     }
 
+    /// @notice Set once by the factory, for a show with discounts.
+    function setDiscountLedger(address ledger) external {
+        if (msg.sender != factory) revert NotFactory();
+        if (discountLedger != address(0)) revert LedgerAlreadySet();
+        if (ledger == address(0)) revert ZeroAddress();
+        discountLedger = ledger;
+    }
+
+    // ─── DISCOUNT DEBTS ───────────────────────────────────────────────────
+
+    /// @notice What a discount funder still owes that has not been taken from its
+    ///         payout. A cancelled show collects nothing: nobody pays for a discount
+    ///         on tickets that were refunded.
+    function debtOutstanding(address funder) public view returns (uint256) {
+        if (discountLedger == address(0) || cancelledAt != 0) return 0;
+        uint256 owed = IDiscountLedger(discountLedger).funderDebit(funder);
+        uint256 taken = debtApplied[funder];
+        return owed > taken ? owed - taken : 0;
+    }
+
+    /// @notice Whether this escrow can collect a funder's debts: how much it is sure to
+    ///         pay it (fixed payouts, which are never a share of what is left), and
+    ///         whether it also has a share of the final sweep. Percentage payouts do
+    ///         not count: they are a share of whatever is in the escrow.
+    function debtRoute(address funder) external view returns (uint256 fixedAmount, bool hasSweepShare) {
+        for (uint256 i = 0; i < payoutRules.length; i++) {
+            if (payoutRules[i].to == funder && payoutRules[i].kind == PayoutKind.FixedAmount) fixedAmount += payoutRules[i].value;
+        }
+        for (uint256 i = 0; i < sweepRule.recipients.length; i++) {
+            if (sweepRule.recipients[i] == funder && sweepRule.bps[i] > 0) hasSweepShare = true;
+        }
+    }
+
+    function _collectDebt(address funder, uint256 amount) internal {
+        debtApplied[funder] += amount;
+        emit DebtApplied(funder, amount);
+    }
+
     // ─── FUNDING ──────────────────────────────────────────────────────────
 
     /// @notice Deposit into escrow (guarantee, advance, top-up). Open once the
@@ -393,12 +439,17 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
 
             uint256 available = distributable();
             uint256 amount;
+            uint256 collected;
             if (rule.kind == PayoutKind.FixedAmount) {
-                if (available < rule.value) {
-                    emit PayoutSkipped(i, rule.value, available);
+                // What the payee owes for discounts it funded comes off what it is paid. The
+                // guarantee itself is unchanged: only the cash paid out is smaller.
+                collected = debtOutstanding(rule.to);
+                if (collected > rule.value) collected = rule.value;
+                amount = rule.value - collected;
+                if (available < amount) {
+                    emit PayoutSkipped(i, amount, available);
                     continue;
                 }
-                amount = rule.value;
             } else {
                 amount = available * rule.value / 10_000;
                 // An empty escrow must not use up a percentage rule.
@@ -409,6 +460,7 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
             }
 
             rule.executed = true;
+            if (collected != 0) _collectDebt(rule.to, collected);
             _payEarning(rule.to, amount, rule.isGuarantee ? Stream.Guarantee : Stream.Other);
             emit PayoutExecuted(i, rule.to, amount);
         }
@@ -430,7 +482,7 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
 
         _payHeldFees();
         uint256 amount = distributable();
-        _splitBySweep(amount, Stream.TicketRevenue);
+        _splitBySweep(amount, Stream.TicketRevenue, true);
 
         emit FinalSweepExecuted(amount);
         emit EscrowCompleted();
@@ -612,7 +664,7 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
         if (status != EscrowStatus.Completed) revert NotCompleted();
         uint256 amount = distributable();
         if (amount == 0) revert NothingToDistribute();
-        _splitBySweep(amount, Stream.Other);
+        _splitBySweep(amount, Stream.Other, false);
         emit LateFundsDistributed(amount);
     }
 
@@ -879,13 +931,58 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
     }
 
     /// @dev The last recipient takes the rounding remainder so nothing is left behind.
-    function _splitBySweep(uint256 amount, Stream stream) internal {
+    function _splitBySweep(uint256 amount, Stream stream, bool collectDebts) internal {
         uint256 n = sweepRule.recipients.length;
-        uint256 paid;
+        if (!collectDebts || discountLedger == address(0)) {
+            uint256 paid;
+            for (uint256 i = 0; i < n; i++) {
+                uint256 share = i == n - 1 ? amount - paid : amount * sweepRule.bps[i] / 10_000;
+                paid += share;
+                _payEarning(sweepRule.recipients[i], share, stream);
+            }
+            return;
+        }
+
+        // Discounts made the escrow receive less than the tickets are worth. Share the money
+        // out as if no discount had been given, then take from each funder what it owes. Those
+        // who funded nothing get exactly what they would have got without any discount.
+        uint256[] memory owed = new uint256[](n);
+        uint256 totalOwed;
         for (uint256 i = 0; i < n; i++) {
-            uint256 share = i == n - 1 ? amount - paid : amount * sweepRule.bps[i] / 10_000;
-            paid += share;
-            _payEarning(sweepRule.recipients[i], share, stream);
+            address r = sweepRule.recipients[i];
+            bool seen;
+            for (uint256 j = 0; j < i; j++) if (sweepRule.recipients[j] == r) seen = true;
+            if (!seen) {
+                owed[i] = debtOutstanding(r);
+                totalOwed += owed[i];
+            }
+        }
+
+        uint256 pot = amount + totalOwed;
+        uint256[] memory pay = new uint256[](n);
+        uint256 payTotal;
+        uint256 allocated;
+        for (uint256 i = 0; i < n; i++) {
+            uint256 share = i == n - 1 ? pot - allocated : pot * sweepRule.bps[i] / 10_000;
+            allocated += share;
+            if (owed[i] > share) owed[i] = share;             // a funder cannot be charged more than its share
+            pay[i] = share - owed[i];
+            payTotal += pay[i];
+        }
+        // A debt bigger than its funder's share leaves more to pay out than there is money:
+        // scale everyone down, so that the escrow is never asked for what it does not hold.
+        if (payTotal > amount) {
+            uint256 scaled;
+            for (uint256 i = 0; i + 1 < n; i++) {
+                pay[i] = pay[i] * amount / payTotal;
+                scaled += pay[i];
+            }
+            pay[n - 1] = amount - scaled;
+        }
+        for (uint256 i = 0; i < n; i++) {
+            address r = sweepRule.recipients[i];
+            if (owed[i] != 0) _collectDebt(r, owed[i]);
+            _payEarning(r, pay[i], stream);
         }
     }
 

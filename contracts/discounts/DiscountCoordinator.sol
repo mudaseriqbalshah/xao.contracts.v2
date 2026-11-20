@@ -140,6 +140,9 @@ contract DiscountCoordinator is IDiscountCoordinator {
     mapping(address => bytes32) public dataCommitment;                // wallet => its consent commitment
     mapping(address => uint256) public funderDebit;                   // everything a funder owes, over all programs
     mapping(address => uint256) public authorizedTotal;               // the caps a funder has authorized, over all programs
+    mapping(address => address) public payeeOf;                       // funder => who the show pays it through (itself, or a tour settlement escrow)
+    mapping(address => uint256) public payeeDebit;                    // payee => what the funders paid through it owe
+    mapping(address => uint256) internal _authorizedVia;              // payee => the caps of funders paid through it (not itself)
     uint256 public totalDebit;
 
     // ─── EVENTS ───────────────────────────────────────────────────────────
@@ -258,7 +261,12 @@ contract DiscountCoordinator is IDiscountCoordinator {
 
         // The show has to be able to collect what a funder owes from what it pays that funder.
         uint256 total = authorizedTotal[funder] - a.maxDebit + maxDebit;
-        _requireRoute(funder, total);
+        address payee = _route(funder, total);
+        if (payee != funder) {
+            uint256 previous = payeeOf[funder] == payee ? authorizedTotal[funder] : 0;
+            _authorizedVia[payee] = _authorizedVia[payee] - previous + total;
+        }
+        payeeOf[funder] = payee;
         authorizedTotal[funder] = total;
 
         a.authorized = true;
@@ -502,6 +510,7 @@ contract DiscountCoordinator is IDiscountCoordinator {
         FunderAuth storage a = _auth[programId][funder];
         a.debited         += amount;
         funderDebit[funder] += amount;
+        payeeDebit[payeeOf[funder]] += amount;
         totalDebit        += amount;
         emit FunderDebited(programId, funder, wallet, amount);
     }
@@ -529,14 +538,51 @@ contract DiscountCoordinator is IDiscountCoordinator {
         return ok && data.length >= 32 && uint256(bytes32(data)) != 0;
     }
 
-    /// @dev A funder is charged by taking it from its payout. If the show only pays it fixed
-    ///      amounts, its caps together cannot be more than those; if it also has a share of
-    ///      the final sweep, its debts come out of that share too.
-    function _requireRoute(address funder, uint256 totalCaps) internal view {
-        (uint256 fixedAmount, bool hasSweepShare) = IDebtRoute(show.escrow()).debtRoute(funder);
-        if (hasSweepShare) return;
-        if (fixedAmount == 0) revert FunderNotPaidByShow();
-        if (totalCaps > fixedAmount) revert CapAboveGuarantee();
+    /// @dev A funder is charged by taking it from its payout. If the show pays the funder
+    ///      directly: with only fixed amounts, its caps together cannot be more than those; with
+    ///      a share of the final sweep, its debts come out of that share too. If the show pays
+    ///      it through a tour settlement escrow, that escrow has to be able to collect from the
+    ///      band under the band's own terms, and the show has to be able to collect from it.
+    function _route(address funder, uint256 totalCaps) internal view returns (address payee) {
+        address escrow = show.escrow();
+        (uint256 fixedAmount, bool hasSweepShare) = IDebtRoute(escrow).debtRoute(funder);
+        if (hasSweepShare) return funder;
+        if (fixedAmount != 0) {
+            if (totalCaps > fixedAmount) revert CapAboveGuarantee();
+            return funder;
+        }
+        return _conduit(escrow, funder, totalCaps);
+    }
+
+    /// @dev Looks for a contract the show pays that stands for the funder (a tour's settlement
+    ///      escrow, for one of its bands).
+    function _conduit(address escrow, address funder, uint256 totalCaps) internal view returns (address) {
+        IEscrowRoutes.PayoutRule[] memory rules = IEscrowRoutes(escrow).getPayoutRules();
+        IEscrowRoutes.SweepRule memory sweep = IEscrowRoutes(escrow).getSweepRule();
+        uint256 n = rules.length + sweep.recipients.length;
+        for (uint256 i = 0; i < n; i++) {
+            address r = i < rules.length ? rules[i].to : sweep.recipients[i - rules.length];
+            if (r == funder || r.code.length == 0) continue;
+            if (_conduitFits(escrow, r, funder, totalCaps)) return r;
+        }
+        revert FunderNotPaidByShow();
+    }
+
+    function _conduitFits(address escrow, address r, address funder, uint256 totalCaps) internal view returns (bool) {
+        (bool ok, bytes memory data) = r.staticcall(abi.encodeCall(IDebtRoute.debtRoute, (funder)));
+        if (!ok || data.length < 64) return false;
+        (uint256 viaFixed, bool viaSweep) = abi.decode(data, (uint256, bool));
+        if (!viaSweep && viaFixed == 0) return false;                          // r does not pay this funder
+
+        (uint256 escrowFixed, bool escrowSweep) = IDebtRoute(escrow).debtRoute(r);
+        if (!escrowSweep && escrowFixed == 0) return false;                    // the show cannot collect from r
+
+        if (!viaSweep && totalCaps > viaFixed) revert CapAboveGuarantee();
+        if (!escrowSweep) {
+            uint256 mine = payeeOf[funder] == r ? authorizedTotal[funder] : 0;
+            if (_authorizedVia[r] - mine + totalCaps > escrowFixed) revert CapAboveGuarantee();
+        }
+        return true;
     }
 
     function _requireShowSide() internal view {

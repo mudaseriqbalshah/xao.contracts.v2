@@ -369,7 +369,7 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
     ///         on tickets that were refunded.
     function debtOutstanding(address funder) public view returns (uint256) {
         if (discountLedger == address(0) || cancelledAt != 0) return 0;
-        uint256 owed = IDiscountLedger(discountLedger).funderDebit(funder);
+        uint256 owed = IDiscountLedger(discountLedger).payeeDebit(funder);
         uint256 taken = debtApplied[funder];
         return owed > taken ? owed - taken : 0;
     }

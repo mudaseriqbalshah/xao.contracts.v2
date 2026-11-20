@@ -156,6 +156,7 @@ contract TourSettlementEscrow is ReentrancyGuard {
     event BandDiscountDebited(address indexed band, address indexed show, uint256 amount);
     event BandPaymentReleased(address indexed band, address indexed show, uint256 amount);
     event RemainderReleased(address indexed show, address indexed to, uint256 amount);
+    event ShowShortfall(address indexed show, uint256 amount);
 
     /// @dev Locks the implementation; only clones can be initialized.
     constructor() {
@@ -315,8 +316,23 @@ contract TourSettlementEscrow is ReentrancyGuard {
             if (debt > 0) emit BandDiscountDebited(t.artistMiniOrg, show, debt);
         }
 
+        // The show's escrow may have taken more from this contract for a band's discounts than the
+        // band could repay out of what it earned. The package is then smaller than the bands are owed:
+        // the shortfall is taken from the bands applied last, so that nobody is paid money that is
+        // not there and the bands applied first are paid in full.
         uint256 have = cash[show];
-        remainderOwed[show] += have > owedToBands ? have - owedToBands : 0;
+        if (owedToBands > have) {
+            uint256 excess = owedToBands - have;
+            for (uint256 i = list.length; i > 0 && excess > 0; i--) {
+                uint256 cut = payableNet[show][list[i - 1]];
+                if (cut > excess) cut = excess;
+                payableNet[show][list[i - 1]] -= cut;
+                excess -= cut;
+            }
+            emit ShowShortfall(show, owedToBands - have);
+            owedToBands = have;
+        }
+        remainderOwed[show] += have - owedToBands;
         settled[show] = true;
     }
 

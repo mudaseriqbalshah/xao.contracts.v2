@@ -488,4 +488,236 @@ describe("TourSettlementEscrow", function () {
       expect(await usdc.balanceOf(module.target)).to.equal(0);
     });
   });
+
+  // ─── BANDS THAT FUND DISCOUNTS ──────────────────────────────────────────
+  describe("discounts funded by a tour's bands", function () {
+    let membership;
+    const NO_CONSENT = { availableMask: 0, grantedMasks: [], commitment: ZERO_BYTES32 };
+
+    async function members() {
+      const mImpl = await (await ethers.getContractFactory("FanMembership")).deploy();
+      const mFactory = await (await ethers.getContractFactory("FanMembershipFactory")).deploy(mImpl.target);
+      const r = await (await mFactory.connect(promoter).createProgram({
+        issuer: promoter.address, scopeType: 0, scopeRef: tourOwner.address, name: "Fans", symbol: "F", baseURI: "",
+        renewable: true, maxSupply: 0, paymentToken: ZERO_ADDRESS, paymentReceiver: ZERO_ADDRESS, saleStart: 0, saleEnd: 0,
+      })).wait();
+      const m = await ethers.getContractAt("FanMembership", mFactory.interface.parseLog(r.logs.find((l) => l.address === mFactory.target)).args.program);
+      await m.connect(promoter).createTier("Member", "", 1, 365 * ONE_DAY, 0, 0, 0, false);
+      for (const w of buyers.slice(0, 3)) await m.connect(promoter).grantMembership(1, w.address, ZERO_BYTES32, ZERO_BYTES32);
+      return m;
+    }
+
+    const memberCfg = (o = {}) => ({
+      membership: membership.target, minTierPriority: 0, isPercent: false, amount: $(2), priority: 1,
+      allowedTypeMask: 1n, budget: 0, redemptionCap: 0, effectiveFrom: 0, effectiveTo: 0, ...o,
+    });
+
+    // A show with discounts whose programs are set up by `setup` before it is signed.
+    async function discountShow(name, setup, o = {}) {
+      const b = await createShow(sys.factory, promoter, showConfig(promoter, tourOwner, t0, {
+        anchors: { termsHash: ethers.id(name) }, funding: [],
+        tiers: [tier({ quantity: 100, priceUSDC: $(20) })],
+        tickets: { discountsEnabled: true },
+        payoutRules: [{ to: module.target, kind: PayoutKind.FixedAmount, value: $(300), notBefore: t0 + 15 * ONE_DAY, isGuarantee: true }],
+        sweep: { recipients: [promoter.address, module.target], bps: [4000, 6000], notBefore: showEnd },
+        ...o,
+      }));
+      await setup(b);
+      await b.show.connect(promoter).signTerms();
+      await b.show.connect(tourOwner).signTerms();
+      await module.connect(tourOwner).registerShow(b.show.target);
+      return b;
+    }
+
+    async function fund(b, band, cap = $(1_000)) {
+      await b.discounts.connect(promoter).configureMembershipProgram(memberCfg());
+      await b.discounts.connect(promoter).proposeFunder(1, band.address, 0);
+      await b.discounts.connect(band).authorizeFunding(1, cap);
+    }
+
+    async function buyDiscounted(b, who) {
+      const price = (await b.ticket.tiers(0)).priceUSDC;
+      const [q, h] = await b.discounts.quote(who.address, [0], [price], await b.ticket.salesTaxBPS(), 200, $(1), NO_CONSENT);
+      await usdc.mint(who.address, q.checkoutTotal);
+      await usdc.connect(who).approve(b.ticket.target, q.checkoutTotal);
+      await b.ticket.connect(who).buyTickets([0], NO_CONSENT, h, q.checkoutTotal);
+    }
+
+    // Three members buy a $2-off ticket, two other people pay the full price, and the show completes.
+    async function playDiscounted(b) {
+      await usdc.mint(promoter.address, $(300));
+      await usdc.connect(promoter).approve(b.escrow.target, $(300));
+      await b.escrow.connect(promoter).deposit($(300));
+      for (const w of buyers.slice(0, 3)) await buyDiscounted(b, w);
+      for (const w of buyers.slice(3, 5)) {
+        await usdc.mint(w.address, $(20));
+        await usdc.connect(w).approve(b.ticket.target, $(20));
+        await b.ticket.connect(w).buyTicket(0);
+      }
+      await time.increaseTo(showEnd);
+      await b.escrow.connect(stranger).executeFinalSweep();
+    }
+
+    async function apply(b, tpa) {
+      const id = await link(tpa, b);
+      await module.connect(tourOwner).applyShow(tpa.target, b.show.target, id);
+    }
+
+    beforeEach(async function () {
+      membership = await members();
+    });
+
+    it("a band with signed terms can fund a discount, and the show's escrow collects from the tour's module", async function () {
+      await agree(tpaA, bandA, Model.Percentage, { percentageBps: 2_500 });
+      const b = await discountShow("tour-discount", (x) => fund(x, bandA));
+      expect(await b.discounts.payeeOf(bandA.address)).to.equal(module.target);
+    });
+
+    it("pays the band less what it owes, leaves everyone else exactly what they would have had, and the package unchanged", async function () {
+      await agree(tpaA, bandA, Model.Percentage, { percentageBps: 2_500 });
+      await agree(tpaB, bandB, Model.FixedShow, { fixedAmount: $(100) });
+      const b = await discountShow("tour-flow", (x) => fund(x, bandA));
+      await apply(b, tpaA);
+      await apply(b, tpaB);
+      await playDiscounted(b);
+
+      expect(await b.discounts.funderDebit(bandA.address)).to.equal($(6));                 // three members, $2 each
+      expect(await b.escrow.debtApplied(module.target)).to.equal($(6));                    // taken from the module's guarantee
+      expect(await b.escrow.earnedBy(promoter.address, 1)).to.equal($(37.2));              // the promoter is untouched by the discounts
+      await module.syncShow(b.show.target);
+      expect(await module.received(b.show.target)).to.equal($(349.8));                     // $294 guarantee + $55.80 sweep
+      await module.settleShow(b.show.target);
+      expect(await module.nominal(b.show.target)).to.equal(PACKAGE);                       // $349.80 + the $6 collected: the package as if no discount
+
+      expect(await module.earnedGross(b.show.target, tpaA.target)).to.equal($(88.95));     // 25% of the package: unchanged by discounts
+      expect(await module.discountDebt(b.show.target, tpaA.target)).to.equal($(6));
+      expect(await module.payableNet(b.show.target, tpaA.target)).to.equal($(82.95));
+      expect(await module.payableNet(b.show.target, tpaB.target)).to.equal($(100));        // the other band pays for nothing
+      expect(await module.remainderOwed(b.show.target)).to.equal($(166.85));               // the tour side gets what it would have without discounts
+
+      await module.releaseBandPayout(b.show.target, tpaA.target);
+      await module.releaseBandPayout(b.show.target, tpaB.target);
+      await module.releaseRemainder(b.show.target);
+      expect(await usdc.balanceOf(bandA.address)).to.equal($(82.95));
+      expect(await usdc.balanceOf(bandB.address)).to.equal($(100));
+      expect(await usdc.balanceOf(module.target)).to.equal(0);
+    });
+
+    it("a band with no signed terms with the tour, or one the show does not pay through the module, cannot fund", async function () {
+      const b1 = await createShow(sys.factory, promoter, showConfig(promoter, tourOwner, t0, {
+        anchors: { termsHash: ethers.id("route-1") }, funding: [], tiers: [tier({ quantity: 10, priceUSDC: $(20) })],
+        tickets: { discountsEnabled: true },
+        payoutRules: [{ to: module.target, kind: PayoutKind.FixedAmount, value: $(300), notBefore: t0 + ONE_DAY, isGuarantee: true }],
+        sweep: { recipients: [promoter.address, module.target], bps: [4000, 6000], notBefore: showEnd },
+      }));
+      await b1.discounts.connect(promoter).configureMembershipProgram(memberCfg());
+      await b1.discounts.connect(promoter).proposeFunder(1, bandA.address, 0);
+      await expect(b1.discounts.connect(bandA).authorizeFunding(1, $(10))).to.be.revertedWithCustomError(b1.discounts, "FunderNotPaidByShow");
+      await module.connect(tourOwner).registerArtistTPA(tpaA.target, await termsFor(tpaA, bandA, Model.Percentage, { percentageBps: 2_500 }));
+      await expect(b1.discounts.connect(bandA).authorizeFunding(1, $(10))).to.be.revertedWithCustomError(b1.discounts, "FunderNotPaidByShow");   // registered, not signed
+      await module.connect(bandA).signArtistTerms(tpaA.target);
+      await module.connect(tourOwner).signArtistTerms(tpaA.target);
+      await b1.discounts.connect(bandA).authorizeFunding(1, $(10));
+
+      // a show that pays someone else, not the module
+      const b2 = await createShow(sys.factory, promoter, showConfig(promoter, tourOwner, t0, {
+        anchors: { termsHash: ethers.id("route-2") }, funding: [], tiers: [tier({ quantity: 10, priceUSDC: $(20) })],
+        tickets: { discountsEnabled: true }, payoutRules: [],
+        sweep: { recipients: [promoter.address, tourOwner.address], bps: [4000, 6000], notBefore: showEnd },
+      }));
+      await b2.discounts.connect(promoter).configureMembershipProgram(memberCfg());
+      await b2.discounts.connect(promoter).proposeFunder(1, bandA.address, 0);
+      await expect(b2.discounts.connect(bandA).authorizeFunding(1, $(10))).to.be.revertedWithCustomError(b2.discounts, "FunderNotPaidByShow");
+    });
+
+    it("a band paid a fixed amount per show cannot promise more than that, and the module's own room is shared by its bands", async function () {
+      await agree(tpaA, bandA, Model.FixedShow, { fixedAmount: $(50) });
+      await agree(tpaB, bandB, Model.Percentage, { percentageBps: 1_000 });
+      // The show pays the module a fixed $300 only, no sweep share: its bands together can promise at most $300.
+      const b = await createShow(sys.factory, promoter, showConfig(promoter, tourOwner, t0, {
+        anchors: { termsHash: ethers.id("room") }, funding: [], tiers: [tier({ quantity: 10, priceUSDC: $(20) })],
+        tickets: { discountsEnabled: true },
+        payoutRules: [{ to: module.target, kind: PayoutKind.FixedAmount, value: $(300), notBefore: t0 + ONE_DAY, isGuarantee: true }],
+        sweep: { recipients: [promoter.address, tourOwner.address], bps: [4000, 6000], notBefore: showEnd },
+      }));
+      await b.discounts.connect(promoter).configureMembershipProgram(memberCfg());
+      await b.discounts.connect(promoter).configureMembershipProgram(memberCfg({ priority: 2 }));
+      for (const [pid, band] of [[1, bandA], [1, bandB], [2, bandB]]) await b.discounts.connect(promoter).proposeFunder(pid, band.address, 0);
+
+      await expect(b.discounts.connect(bandA).authorizeFunding(1, $(50) + 1n)).to.be.revertedWithCustomError(b.discounts, "CapAboveGuarantee");   // above its own $50
+      await b.discounts.connect(bandA).authorizeFunding(1, $(50));
+      await b.discounts.connect(bandB).authorizeFunding(1, $(200));                         // 50 + 200 so far
+      await expect(b.discounts.connect(bandB).authorizeFunding(2, $(51))).to.be.revertedWithCustomError(b.discounts, "CapAboveGuarantee");         // 50 + 200 + 51 > 300
+      await b.discounts.connect(bandB).authorizeFunding(2, $(50));
+      await b.discounts.connect(bandB).authorizeFunding(1, $(150));                         // lowering a cap frees room
+      await expect(b.discounts.connect(bandB).authorizeFunding(1, $(201))).to.be.revertedWithCustomError(b.discounts, "CapAboveGuarantee");
+    });
+
+    it("a cancelled show collects nothing from the module, and the module is owed nothing", async function () {
+      await agree(tpaA, bandA, Model.Percentage, { percentageBps: 2_500 });
+      const b = await discountShow("tour-cancel", (x) => fund(x, bandA));
+      await apply(b, tpaA);
+      await buyDiscounted(b, buyers[0]);
+      expect(await b.discounts.funderDebit(bandA.address)).to.equal($(2));
+      await b.escrow.connect(promoter).cancel();
+      await b.escrow.connect(stranger).continueRefunds(5);
+      await b.escrow.connect(stranger).finalizeCancellationPayout();
+      expect(await b.escrow.debtApplied(module.target)).to.equal(0);
+      await module.settleShow(b.show.target);
+      expect(await module.received(b.show.target)).to.equal(0);
+      expect(await module.payableNet(b.show.target, tpaA.target)).to.equal(0);
+    });
+
+    it("a show that pays the module only a percentage of its balance gives it no way to collect, so its bands cannot fund", async function () {
+      await agree(tpaA, bandA, Model.Percentage, { percentageBps: 2_500 });
+      const b = await createShow(sys.factory, promoter, showConfig(promoter, tourOwner, t0, {
+        anchors: { termsHash: ethers.id("percentage-only") }, funding: [], tiers: [tier({ quantity: 10, priceUSDC: $(20) })],
+        tickets: { discountsEnabled: true },
+        payoutRules: [{ to: module.target, kind: PayoutKind.PercentageOfCurrentBalance, value: 5_000, notBefore: t0 + ONE_DAY, isGuarantee: false }],
+        sweep: { recipients: [promoter.address, tourOwner.address], bps: [4000, 6000], notBefore: showEnd },
+      }));
+      await b.discounts.connect(promoter).configureMembershipProgram(memberCfg());
+      await b.discounts.connect(promoter).proposeFunder(1, bandA.address, 0);
+      await expect(b.discounts.connect(bandA).authorizeFunding(1, $(10))).to.be.revertedWithCustomError(b.discounts, "FunderNotPaidByShow");
+    });
+
+    it("when the module is short, the bands applied last are cut and the ones applied first are paid in full", async function () {
+      const bandC = agent;
+      const tpaC = await newTPA(bandC, "tpa-C");
+      await agree(tpaA, bandA, Model.Percentage, { percentageBps: 100 });          // owes $6, earns $3.558
+      await agree(tpaB, bandB, Model.FixedShow, { fixedAmount: $(100) });
+      await agree(tpaC, bandC, Model.FixedShow, { fixedAmount: PACKAGE });
+      const b = await discountShow("tour-shortfall-3", (x) => fund(x, bandA));
+      await apply(b, tpaA);
+      await apply(b, tpaB);
+      await apply(b, tpaC);
+      await playDiscounted(b);
+      await module.settleShow(b.show.target);
+
+      expect(await module.payableNet(b.show.target, tpaB.target)).to.equal($(100));          // applied earlier: paid in full
+      expect(await module.payableNet(b.show.target, tpaC.target)).to.equal($(249.8));        // applied last: $252.242 owed, cut by the $2.442 shortfall
+      await expect(module.settleShow(b.show.target)).to.be.revertedWithCustomError(module, "ShowAlreadySettled");
+    });
+
+    it("a debt bigger than what the band earned is cut from the bands applied last, never paid out of money that is not there", async function () {
+      // bandA earns 1% of the package ($3.558) but owes $6; bandB is owed almost all of the package.
+      await agree(tpaA, bandA, Model.Percentage, { percentageBps: 100 });
+      await agree(tpaB, bandB, Model.FixedShow, { fixedAmount: PACKAGE });
+      const b = await discountShow("tour-shortfall", (x) => fund(x, bandA));
+      await apply(b, tpaA);
+      await apply(b, tpaB);
+      await playDiscounted(b);
+      await module.settleShow(b.show.target);
+
+      expect(await module.discountDebt(b.show.target, tpaA.target)).to.equal(3_558_000n);    // the most bandA can repay
+      expect(await module.payableNet(b.show.target, tpaA.target)).to.equal(0);
+      // The escrow took $6 for bandA's discounts, but bandA could only repay $3.558: the module is $2.442 short.
+      expect(await module.payableNet(b.show.target, tpaB.target)).to.equal($(349.8));       // $352.242 owed, cut to the money there is
+      expect(await module.remainderOwed(b.show.target)).to.equal(0);
+      await module.releaseBandPayout(b.show.target, tpaB.target);
+      expect(await usdc.balanceOf(bandB.address)).to.equal($(349.8));
+      expect(await usdc.balanceOf(module.target)).to.equal(0);
+      await expect(module.releaseRemainder(b.show.target)).to.be.revertedWithCustomError(module, "NothingToPay");
+    });
+  });
 });

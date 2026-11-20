@@ -3,7 +3,21 @@ pragma solidity ^0.8.20;
 
 /// @notice What an escrow reads from a show's discount coordinator: what each funder owes.
 interface IDiscountLedger {
+    /// @notice What a funder owes for the discounts it offered.
     function funderDebit(address funder) external view returns (uint256);
+
+    /// @notice What the show's escrow has to collect from `payee`: the debts of every funder
+    ///         the show pays through it. For a funder paid directly this is its own debt; for a
+    ///         tour band it is collected from the tour's settlement escrow, which is the payee.
+    function payeeDebit(address payee) external view returns (uint256);
+}
+
+/// @dev The escrow's payout rules and sweep, as the coordinator reads them to find who pays a funder.
+interface IEscrowRoutes {
+    struct PayoutRule { address to; uint8 kind; uint256 value; uint64 notBefore; bool executed; bool isGuarantee; }
+    struct SweepRule { address[] recipients; uint16[] bps; uint64 notBefore; }
+    function getPayoutRules() external view returns (PayoutRule[] memory);
+    function getSweepRule() external view returns (SweepRule memory);
 }
 
 /// @notice What the discount coordinator asks an escrow before it accepts a funder: can the

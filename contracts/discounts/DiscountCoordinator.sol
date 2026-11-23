@@ -138,6 +138,8 @@ contract DiscountCoordinator is IDiscountCoordinator {
     mapping(uint256 => mapping(address => bool)) public redeemed;     // membership program => wallet
     mapping(address => bool) public dataClaimed;                      // wallet
     mapping(address => bytes32) public dataCommitment;                // wallet => its consent commitment
+    mapping(address => mapping(address => uint256)) public dataShare; // wallet => data funder => what that funder was charged for the claim
+    address public dataGuard;                                         // the show's data module (0 = none: every data funder counts)
     mapping(address => uint256) public funderDebit;                   // everything a funder owes, over all programs
     mapping(address => uint256) public authorizedTotal;               // the caps a funder has authorized, over all programs
     mapping(address => address) public payeeOf;                       // funder => who the show pays it through (itself, or a tour settlement escrow)
@@ -155,6 +157,7 @@ contract DiscountCoordinator is IDiscountCoordinator {
     event DiscountGranted(address indexed wallet, uint256 indexed programId, uint256 itemIndex, uint256 amount);
     event FunderDebited(uint256 indexed programId, address indexed funder, address indexed wallet, uint256 amount);
     event DataClaimed(address indexed wallet, bytes32 commitment);
+    event DataGuardSet(address indexed guard);
     event MemberBenefitRedeemed(address indexed wallet, uint256 indexed programId);
 
     /// @dev Locks the implementation; only clones can be initialized.
@@ -230,6 +233,16 @@ contract DiscountCoordinator is IDiscountCoordinator {
         _memberOrder[at] = programId;
 
         emit MembershipProgramConfigured(programId, c.membership, c.priority, c.amount, c.isPercent, c.allowedTypeMask);
+    }
+
+    /// @notice Name the data module that says which data funders are backed (have their
+    ///         early-access reserve in). Show side only, before the show is signed.
+    function setDataGuard(address guard) external {
+        _requireShowSide();
+        _requireOpen();
+        if (guard != address(0) && guard.code.length == 0) revert ZeroAddress();
+        dataGuard = guard;
+        emit DataGuardSet(guard);
     }
 
     /// @notice List a funder on a program. This only proposes: nothing is charged
@@ -433,7 +446,7 @@ contract DiscountCoordinator is IDiscountCoordinator {
         for (uint256 i = 0; i < list.length; i++) {
             FunderAuth storage a = _auth[id][list[i]];
             bool hasRoom = a.maxDebit >= a.debited + exposure;
-            offer.program.grantedMasks[i] = (_funderIn(id, list[i]) && hasRoom) ? (consent.grantedMasks[i] & a.categoryMask) : 0;
+            offer.program.grantedMasks[i] = (_funderIn(id, list[i]) && hasRoom && _backed(list[i])) ? (consent.grantedMasks[i] & a.categoryMask) : 0;
         }
 
         offer.program.active        = true;
@@ -487,7 +500,10 @@ contract DiscountCoordinator is IDiscountCoordinator {
         p.redemptions++;
         address[] storage list = _funders[id];
         for (uint256 i = 0; i < list.length; i++) {
-            if (r.dataDebits[i] > 0) _charge(id, list[i], wallet, r.dataDebits[i]);
+            if (r.dataDebits[i] > 0) {
+                dataShare[wallet][list[i]] = r.dataDebits[i];
+                _charge(id, list[i], wallet, r.dataDebits[i]);
+            }
         }
         emit DataClaimed(wallet, commitment);
         emit DiscountGranted(wallet, id, r.dataItem, r.dataDiscount);
@@ -520,6 +536,15 @@ contract DiscountCoordinator is IDiscountCoordinator {
     function _funderIn(uint256 programId, address funder) internal view returns (bool) {
         FunderAuth storage a = _auth[programId][funder];
         return a.authorized && !a.withdrawn;
+    }
+
+    /// @dev A data funder counts only if the show's data module (when there is one) says it is
+    ///      backed. A module that cannot answer counts as not backed.
+    function _backed(address funder) internal view returns (bool) {
+        address g = dataGuard;
+        if (g == address(0)) return true;
+        (bool ok, bytes memory data) = g.staticcall(abi.encodeCall(IDataGuard.funderBacked, (funder)));
+        return ok && data.length >= 32 && uint256(bytes32(data)) != 0;
     }
 
     /// @dev The roster entry the caller speaks for: itself, or the org wallet it is an owner or admin of.

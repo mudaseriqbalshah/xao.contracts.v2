@@ -162,6 +162,9 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
 
     /// @notice Everything ever paid in: party deposits plus net ticket revenue.
     uint256 public totalFunded;
+    /// @notice Only what parties deposited (guarantee, advance, top-up): not ticket money, which a
+    ///         cancellation would refund. A tour counts a show's guarantee as secured by this.
+    uint256 public partyDeposited;
     /// @notice XAO's share of ticket sales, held until the show completes.
     uint256 public protocolFeeAccrued;
 
@@ -403,6 +406,7 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
         if (amount == 0) revert ZeroAmount();
 
         totalFunded += amount;
+        partyDeposited += amount;
         _pullToken(msg.sender, amount);
         emit Deposited(msg.sender, amount);
     }

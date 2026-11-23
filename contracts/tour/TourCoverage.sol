@@ -75,6 +75,8 @@ contract TourCoverage is ReentrancyGuard {
     error ZeroAmount();
     error CoverageLocked();
     error ExceedsDeposit();
+    error NotShell();
+    error Sealed();
 
     struct Guarantee {
         address tpa;
@@ -115,6 +117,7 @@ contract TourCoverage is ReentrancyGuard {
     mapping(uint256 => mapping(address => uint256)) public invalidated;     // id => show => cover last found missing
 
     bool public launchCleared;
+    bool public isSealed;                 // the tour has started: no new guarantee, signature or reservation
     uint256 public requiredCoverage;
     uint256 public eligibleCoverage;
 
@@ -128,6 +131,7 @@ contract TourCoverage is ReentrancyGuard {
     event TourCoverageUpdated(uint256 required, uint256 eligible);
     event ShowCoverageInvalidated(uint256 indexed id, address indexed show, uint256 removed);
     event LaunchCleared(uint256 required);
+    event CoverageSealed();
 
     /// @dev Locks the implementation; only clones can be initialized.
     constructor() {
@@ -151,6 +155,7 @@ contract TourCoverage is ReentrancyGuard {
     function registerGuarantee(address tpa, uint256 amount, uint64 coverageDeadline) external returns (uint256 id) {
         _requireTourSide();
         if (launchCleared) revert AlreadyCleared();
+        if (isSealed) revert Sealed();
         if (!tourShell.isTPA(tpa)) revert UnknownTPA();
         if (guaranteeOf[tpa] != 0) revert GuaranteeExists();
         if (guaranteeCount >= MAX_GUARANTEES) revert TooMany();
@@ -174,6 +179,7 @@ contract TourCoverage is ReentrancyGuard {
     ///         owner or admin of its org wallet can: an agent cannot bind either side.
     function signGuarantee(uint256 id) external {
         Guarantee storage g = _guarantee(id);
+        if (isSealed) revert Sealed();
         bool asBand    = _speaksFor(g.beneficiary, msg.sender);
         bool asObligor = _speaksFor(g.obligor, msg.sender);
         if (!asBand && !asObligor) revert NotAuthorized();
@@ -199,7 +205,7 @@ contract TourCoverage is ReentrancyGuard {
 
     function withdrawCoverage(uint256 id, uint256 amount) external nonReentrant {
         Guarantee storage g = _guarantee(id);
-        if (launchCleared) revert CoverageLocked();
+        if (launchCleared && tourShell.state() != 3) revert CoverageLocked();
         if (amount == 0) revert ZeroAmount();
         if (amount > depositedBy[id][msg.sender]) revert ExceedsDeposit();
 
@@ -217,7 +223,7 @@ contract TourCoverage is ReentrancyGuard {
     function reserveShow(uint256 id, address show, bytes32 linkEdgeId, uint256 amount) external {
         _requireTourSide();
         Guarantee storage g = _guarantee(id);
-        if (launchCleared) revert AlreadyCleared();
+        if (launchCleared) revert AlreadyCleared();                       // a tour with something to cover cannot start before this is true
         if (!_signed(g)) revert NotSigned();
         if (amount == 0) revert ZeroAmount();
         if (_reservationIndex(id, show) != type(uint256).max) revert AlreadyReserved();
@@ -257,6 +263,14 @@ contract TourCoverage is ReentrancyGuard {
     }
 
     // ─── THE LEDGER ───────────────────────────────────────────────────────
+
+    /// @notice Called by the tour shell when the tour starts. After this nothing new can become a
+    ///         guarantee that has to be covered; cover can still be added and is still reconciled.
+    function seal() external {
+        if (msg.sender != address(tourShell)) revert NotShell();
+        isSealed = true;
+        emit CoverageSealed();
+    }
 
     /// @notice Work out, from what is true now, how much of each guarantee is covered. Anyone can
     ///         call it. A show's cover is given to the guarantees that reserved it in the order

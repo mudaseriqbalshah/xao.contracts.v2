@@ -15,6 +15,8 @@ interface ITourShellView {
     function isOperator(address) external view returns (bool);
     function isTPA(address) external view returns (bool);
     function graphRegistry() external view returns (address);
+    /// @dev 0 Booking, 1 Touring, 2 Settling, 3 Closed.
+    function state() external view returns (uint8);
 }
 
 interface ITPAView {
@@ -89,6 +91,7 @@ contract TourSettlementEscrow is ReentrancyGuard {
     error ShowNotCompleted();
     error ShowNotSettled();
     error NothingToPay();
+    error TourWindingDown();
 
     enum PayModel { FixedShow, FixedTour, Percentage, MixedShow, MixedTour }
     enum PayTiming { AfterShowSettlement, TourMilestone, EndOfTour }
@@ -180,6 +183,7 @@ contract TourSettlementEscrow is ReentrancyGuard {
     ///         the band and the tour obligor have both signed them here.
     function registerArtistTPA(address tpa, ArtistTerms calldata t) external {
         _requireTourSide();
+        _requireNotWindingDown();
         if (!tourShell.isTPA(tpa)) revert UnknownTPA();
         if (termsRegistered[tpa]) revert AlreadyRegistered();
         if (_tpas.length >= MAX_TPAS) revert TooMany();
@@ -223,6 +227,7 @@ contract TourSettlementEscrow is ReentrancyGuard {
     ///         by the show factory, be signed, and its escrow must pay this contract.
     function registerShow(address show) external {
         _requireTourSide();
+        _requireNotWindingDown();
         if (isShow[show]) revert AlreadyRegistered();
         if (_shows.length >= MAX_SHOWS) revert TooMany();
 
@@ -242,6 +247,7 @@ contract TourSettlementEscrow is ReentrancyGuard {
     ///         terms signed by both sides. The graph alone never moves money.
     function applyShow(address tpa, address show, bytes32 linkEdgeId) external {
         _requireTourSide();
+        _requireNotWindingDown();
         if (!isShow[show]) revert UnknownShow();
         if (settled[show]) revert ShowAlreadySettled();
         if (!termsRegistered[tpa]) revert UnknownTPA();
@@ -376,6 +382,21 @@ contract TourSettlementEscrow is ReentrancyGuard {
 
     // ─── VIEWS ────────────────────────────────────────────────────────────
 
+    /// @notice Whether the tour can be closed as far as this contract goes: every show is settled
+    ///         and all the money it received has been paid out, or the show was cancelled or expired
+    ///         and sent nothing. Read by the tour shell when it closes the tour.
+    function canClose() external view returns (bool) {
+        for (uint256 i = 0; i < _shows.length; i++) {
+            address s = _shows[i];
+            if (cash[s] != 0) return false;
+            if (!settled[s]) {                                  // not settled: only a cancelled or expired show is done
+                uint8 st = IShowInstanceLike(s).status();
+                if (st != 5 && st != 6) return false;
+            }
+        }
+        return true;
+    }
+
     function getArtistTerms(address tpa) external view returns (ArtistTerms memory) {
         if (!termsRegistered[tpa]) revert UnknownTPA();
         return _terms[tpa];
@@ -431,6 +452,10 @@ contract TourSettlementEscrow is ReentrancyGuard {
         uint256 share = base * t.percentageBps / BPS;
         if (t.model == PayModel.Percentage) return share;
         return share > t.guaranteedFloor ? share : t.guaranteedFloor;      // MixedShow: the higher of the two
+    }
+
+    function _requireNotWindingDown() internal view {
+        if (tourShell.state() >= 2) revert TourWindingDown();
     }
 
     function _requireTourSide() internal view {

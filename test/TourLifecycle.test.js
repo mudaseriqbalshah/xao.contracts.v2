@@ -63,7 +63,7 @@ describe("Tour lifecycle", function () {
   }
 
   async function guarantee(tpa, band, amount, dl = deadline) {
-    await coverage.connect(tourOwner).registerGuarantee(tpa.target, amount, dl);
+    await coverage.connect(tourOwner).registerGuarantee(tpa.target, amount, dl, ZERO_ADDRESS);
     const id = await coverage.guaranteeCount();
     await coverage.connect(band).signGuarantee(id);
     await coverage.connect(tourOwner).signGuarantee(id);
@@ -229,7 +229,7 @@ describe("Tour lifecycle", function () {
     });
 
     it("is not held up by a guarantee that was never signed, but that guarantee can then never be signed", async function () {
-      await coverage.connect(tourOwner).registerGuarantee(tpaA.target, $(5000), deadline);
+      await coverage.connect(tourOwner).registerGuarantee(tpaA.target, $(5000), deadline, ZERO_ADDRESS);
       await coverage.connect(bandA).signGuarantee(1);                                    // only half signed
       await shell.connect(tourOwner).requestTourStart();
       await expect(coverage.connect(tourOwner).signGuarantee(1)).to.be.revertedWithCustomError(coverage, "Sealed");
@@ -250,11 +250,11 @@ describe("Tour lifecycle", function () {
       await putIn(id, funder, $(60));
       await putIn(id, funder, $(40));
       await shell.connect(tourOwner).requestTourStart();
-      await expect(coverage.connect(tourOwner).registerGuarantee(tpaB.target, $(1), deadline)).to.be.revertedWithCustomError(coverage, "AlreadyCleared");
+      await expect(coverage.connect(tourOwner).registerGuarantee(tpaB.target, $(1), deadline, ZERO_ADDRESS)).to.be.revertedWithCustomError(coverage, "AlreadyCleared");
 
       await buildTour();                                                                  // a tour that started with nothing to cover
       await shell.connect(tourOwner).requestTourStart();
-      await expect(coverage.connect(tourOwner).registerGuarantee(tpaA.target, $(1), deadline)).to.be.revertedWithCustomError(coverage, "Sealed");
+      await expect(coverage.connect(tourOwner).registerGuarantee(tpaA.target, $(1), deadline, ZERO_ADDRESS)).to.be.revertedWithCustomError(coverage, "Sealed");
     });
 
     it("can only be sealed by the shell", async function () {

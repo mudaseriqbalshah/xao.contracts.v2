@@ -33,8 +33,8 @@ describe("TourCoverage", function () {
     return tpa;
   }
 
-  async function buildTour() {
-    sys = await deploySystem();
+  async function buildTour(tokenName = "MockERC20") {
+    sys = await deploySystem(tokenName);
     usdc = sys.usdc;
     registry = sys.registry;
     const tpaImpl = await (await ethers.getContractFactory("TourParticipationAgreement")).deploy();
@@ -62,7 +62,7 @@ describe("TourCoverage", function () {
 
   // A tour-wide guarantee for a band, signed by both sides.
   async function guarantee(tpa, band, amount, dl = deadline) {
-    await coverage.connect(tourOwner).registerGuarantee(tpa.target, amount, dl);
+    await coverage.connect(tourOwner).registerGuarantee(tpa.target, amount, dl, ZERO_ADDRESS);
     const id = await coverage.guaranteeCount();
     await coverage.connect(band).signGuarantee(id);
     await coverage.connect(tourOwner).signGuarantee(id);
@@ -151,13 +151,13 @@ describe("TourCoverage", function () {
   // ─── GUARANTEES ─────────────────────────────────────────────────────────
   describe("a tour-wide guarantee", function () {
     it("is registered by the tour side against an active TPA of this tour, once", async function () {
-      await expect(coverage.connect(stranger).registerGuarantee(tpaA.target, $(1000), deadline)).to.be.revertedWithCustomError(coverage, "NotTourSide");
-      await expect(coverage.connect(tourOwner).registerGuarantee(stranger.address, $(1000), deadline)).to.be.revertedWithCustomError(coverage, "UnknownTPA");
-      await expect(coverage.connect(tourOwner).registerGuarantee(tpaA.target, 0, deadline)).to.be.revertedWithCustomError(coverage, "InvalidGuarantee");
-      await expect(coverage.connect(tourOwner).registerGuarantee(tpaA.target, $(1000), t0)).to.be.revertedWithCustomError(coverage, "InvalidGuarantee");
-      await expect(coverage.connect(tourOwner).registerGuarantee(tpaA.target, $(1000), deadline))
+      await expect(coverage.connect(stranger).registerGuarantee(tpaA.target, $(1000), deadline, ZERO_ADDRESS)).to.be.revertedWithCustomError(coverage, "NotTourSide");
+      await expect(coverage.connect(tourOwner).registerGuarantee(stranger.address, $(1000), deadline, ZERO_ADDRESS)).to.be.revertedWithCustomError(coverage, "UnknownTPA");
+      await expect(coverage.connect(tourOwner).registerGuarantee(tpaA.target, 0, deadline, ZERO_ADDRESS)).to.be.revertedWithCustomError(coverage, "InvalidGuarantee");
+      await expect(coverage.connect(tourOwner).registerGuarantee(tpaA.target, $(1000), t0, ZERO_ADDRESS)).to.be.revertedWithCustomError(coverage, "InvalidGuarantee");
+      await expect(coverage.connect(tourOwner).registerGuarantee(tpaA.target, $(1000), deadline, ZERO_ADDRESS))
         .to.emit(coverage, "GuaranteeRegistered").withArgs(1, tpaA.target, bandA.address, $(1000), deadline);
-      await expect(coverage.connect(tourOwner).registerGuarantee(tpaA.target, $(1000), deadline)).to.be.revertedWithCustomError(coverage, "GuaranteeExists");
+      await expect(coverage.connect(tourOwner).registerGuarantee(tpaA.target, $(1000), deadline, ZERO_ADDRESS)).to.be.revertedWithCustomError(coverage, "GuaranteeExists");
       const g = await coverage.getGuarantee(1);
       expect(g.tpa).to.equal(tpaA.target);
       expect(g.beneficiary).to.equal(bandA.address);
@@ -173,7 +173,7 @@ describe("TourCoverage", function () {
         metaHash: ZERO_BYTES32, metaCID: "", supersedes: ZERO_ADDRESS,
       });
       const log = (await tx.wait()).logs.map((l) => { try { return shell.interface.parseLog(l); } catch { return null; } }).find((l) => l && l.name === "TPACreated");
-      await expect(coverage.connect(tourOwner).registerGuarantee(log.args.tpa, $(1), deadline)).to.be.revertedWithCustomError(coverage, "TPANotActive");
+      await expect(coverage.connect(tourOwner).registerGuarantee(log.args.tpa, $(1), deadline, ZERO_ADDRESS)).to.be.revertedWithCustomError(coverage, "TPANotActive");
 
       // a TPA of another tour
       const tpaImpl = await (await ethers.getContractFactory("TourParticipationAgreement")).deploy();
@@ -185,11 +185,11 @@ describe("TourCoverage", function () {
         partyB: bandA.address, termsHash: ethers.id("o"), termsCID: "x", effectiveFrom: 0, effectiveTo: 0, metaHash: ZERO_BYTES32, metaCID: "", supersedes: ZERO_ADDRESS,
       })).wait();
       const tpa2 = other.interface.parseLog(t2.logs.find((l) => { try { return other.interface.parseLog(l).name === "TPACreated"; } catch { return false; } })).args.tpa;
-      await expect(coverage.connect(tourOwner).registerGuarantee(tpa2, $(1), deadline)).to.be.revertedWithCustomError(coverage, "UnknownTPA");
+      await expect(coverage.connect(tourOwner).registerGuarantee(tpa2, $(1), deadline, ZERO_ADDRESS)).to.be.revertedWithCustomError(coverage, "UnknownTPA");
     });
 
     it("counts only once the band and the tour obligor have both signed it; an agent cannot sign for either", async function () {
-      await coverage.connect(tourOwner).registerGuarantee(tpaA.target, $(1000), deadline);
+      await coverage.connect(tourOwner).registerGuarantee(tpaA.target, $(1000), deadline, ZERO_ADDRESS);
       await shell.connect(tourOwner).setOperator(agent.address, true);
       await expect(coverage.connect(agent).signGuarantee(1)).to.be.revertedWithCustomError(coverage, "NotAuthorized");
       await expect(coverage.connect(stranger).signGuarantee(1)).to.be.revertedWithCustomError(coverage, "NotAuthorized");
@@ -206,16 +206,16 @@ describe("TourCoverage", function () {
       for (let i = 0; i < 16; i++) {
         const band = (await ethers.getSigners())[(i % 5) + 10];
         const tpa = await newTPA(band, "many-" + i);
-        await coverage.connect(tourOwner).registerGuarantee(tpa.target, $(1), deadline);
+        await coverage.connect(tourOwner).registerGuarantee(tpa.target, $(1), deadline, ZERO_ADDRESS);
       }
-      await expect(coverage.connect(tourOwner).registerGuarantee(tpaA.target, $(1), deadline)).to.be.revertedWithCustomError(coverage, "TooMany");
+      await expect(coverage.connect(tourOwner).registerGuarantee(tpaA.target, $(1), deadline, ZERO_ADDRESS)).to.be.revertedWithCustomError(coverage, "TooMany");
     });
   });
 
   // ─── MONEY DEPOSITED AS COVER ───────────────────────────────────────────
   describe("deposited cover", function () {
     it("is accepted for a signed guarantee, up to what it lacks, from anyone", async function () {
-      await coverage.connect(tourOwner).registerGuarantee(tpaA.target, $(1000), deadline);
+      await coverage.connect(tourOwner).registerGuarantee(tpaA.target, $(1000), deadline, ZERO_ADDRESS);
       await expect(putIn(1, funder, $(1))).to.be.revertedWithCustomError(coverage, "NotSigned");
       await coverage.connect(bandA).signGuarantee(1);
       await coverage.connect(tourOwner).signGuarantee(1);
@@ -251,16 +251,19 @@ describe("TourCoverage", function () {
 
   // ─── WHAT A SHOW COUNTS FOR ─────────────────────────────────────────────
   describe("what a show is worth as cover", function () {
-    it("is its guaranteed payment to this tour, once the parties have funded the show", async function () {
+    it("is its guaranteed payment to this tour: contracted while the parties have not funded it, secured once they have", async function () {
       const b = await newShow("funded", { funded: false });
-      expect(await coverage.showCover(b.show.target)).to.equal(0);                  // promised but not funded
+      expect(await coverage.showCover(b.show.target)).to.equal($(300));             // signed: counts, funded or not
+      expect(await coverage.showSecured(b.show.target)).to.equal(0);                // but nothing is secured yet
       await fund(b, $(299));
-      expect(await coverage.showCover(b.show.target)).to.equal(0);                  // one dollar short
+      expect(await coverage.showCover(b.show.target)).to.equal($(300));
+      expect(await coverage.showSecured(b.show.target)).to.equal(0);                // one dollar short of secured
       await fund(b, $(1));
       expect(await coverage.showCover(b.show.target)).to.equal($(300));
+      expect(await coverage.showSecured(b.show.target)).to.equal($(300));
     });
 
-    it("is nothing when only ticket sales fund the show: a cancelled show refunds them", async function () {
+    it("is never made secured by ticket sales alone: a cancelled show refunds them", async function () {
       const b = await newShow("tickets-only", { fixed: $(100), funded: false });
       const buyers = (await ethers.getSigners()).slice(10, 20);
       for (const w of buyers) {
@@ -271,19 +274,22 @@ describe("TourCoverage", function () {
       expect(await b.escrow.totalFunded()).to.be.gte($(100));                       // the show looks "funded" by tickets
       expect(await b.escrow.fundingNeed()).to.equal(0);
       expect(await b.escrow.partyDeposited()).to.equal(0);
-      expect(await coverage.showCover(b.show.target)).to.equal(0);
+      expect(await coverage.showCover(b.show.target)).to.equal($(100));             // contracted, as it was before the tickets
+      expect(await coverage.showSecured(b.show.target)).to.equal(0);                // and not secured by them
     });
 
-    it("counts every fixed payment to the module, and needs the parties to have funded all the show promises", async function () {
+    it("counts every fixed payment to the module, and calls it secured only when the parties have funded all the show promises", async function () {
       const rules = [
         { to: module.target, kind: PayoutKind.FixedAmount, value: $(200), notBefore: t0 + 15 * ONE_DAY, isGuarantee: true },
         { to: bandB.address, kind: PayoutKind.FixedAmount, value: $(100), notBefore: t0 + 15 * ONE_DAY, isGuarantee: true },
       ];
       const b = await newShow("two-rules", { rules, funded: false });
       await fund(b, $(299));
-      expect(await coverage.showCover(b.show.target)).to.equal(0);                  // the other band's $100 is promised too
+      expect(await coverage.showCover(b.show.target)).to.equal($(200));
+      expect(await coverage.showSecured(b.show.target)).to.equal(0);                // the other band's $100 is promised too
       await fund(b, $(1));
       expect(await coverage.showCover(b.show.target)).to.equal($(200));
+      expect(await coverage.showSecured(b.show.target)).to.equal($(200));
     });
 
     it("is nothing for a show the settlement module does not know, or that does not pay it a fixed amount", async function () {
@@ -336,7 +342,7 @@ describe("TourCoverage", function () {
   describe("reserving a show's cover", function () {
     it("takes the tour side, a signed guarantee, a confirmed link from the guarantee's TPA, and a show that can cover it", async function () {
       const b = await newShow("r1");
-      await coverage.connect(tourOwner).registerGuarantee(tpaA.target, $(1000), deadline);
+      await coverage.connect(tourOwner).registerGuarantee(tpaA.target, $(1000), deadline, ZERO_ADDRESS);
       const edge = await link(tpaA, b);
       await expect(coverage.connect(tourOwner).reserveShow(1, b.show.target, edge, $(100))).to.be.revertedWithCustomError(coverage, "NotSigned");
       await coverage.connect(bandA).signGuarantee(1);
@@ -374,9 +380,16 @@ describe("TourCoverage", function () {
     });
 
     it("refuses a show that cannot cover anything", async function () {
-      const unfunded = await newShow("r3", { funded: false });
+      const sweepOnly = await newShow("r3", { rules: [], funded: false });
       const id = await guarantee(tpaA, bandA, $(1000));
-      await expect(reserve(id, tpaA, unfunded, $(10))).to.be.revertedWithCustomError(coverage, "ShowNotEligible");
+      await expect(reserve(id, tpaA, sweepOnly, $(10))).to.be.revertedWithCustomError(coverage, "ShowNotEligible");
+    });
+
+    it("accepts a signed show that its parties have not funded yet", async function () {
+      const unfunded = await newShow("r4", { funded: false });
+      const id = await guarantee(tpaA, bandA, $(1000));
+      await reserve(id, tpaA, unfunded, $(300));
+      expect((await coverage.getReservations(id)).map((r) => r.amount)).to.deep.equal([$(300)]);
     });
 
     it("never counts a dollar of a show for two guarantees", async function () {
@@ -420,7 +433,7 @@ describe("TourCoverage", function () {
       expect(await coverage.launchCleared()).to.equal(true);
       await expect(coverage.connect(tourOwner).releaseShow(g1, b.show.target)).to.be.revertedWithCustomError(coverage, "AlreadyCleared");
       const g2tpa = tpaB;
-      await expect(coverage.connect(tourOwner).registerGuarantee(g2tpa.target, $(1), deadline)).to.be.revertedWithCustomError(coverage, "AlreadyCleared");
+      await expect(coverage.connect(tourOwner).registerGuarantee(g2tpa.target, $(1), deadline, ZERO_ADDRESS)).to.be.revertedWithCustomError(coverage, "AlreadyCleared");
       const b2 = await newShow("closed-2");
       const edge = await link(tpaA, b2);
       await expect(coverage.connect(tourOwner).reserveShow(g1, b2.show.target, edge, 1)).to.be.revertedWithCustomError(coverage, "AlreadyCleared");
@@ -481,7 +494,7 @@ describe("TourCoverage", function () {
     });
 
     it("ignores a guarantee that is not signed by both sides", async function () {
-      await coverage.connect(tourOwner).registerGuarantee(tpaA.target, $(5_000), deadline);
+      await coverage.connect(tourOwner).registerGuarantee(tpaA.target, $(5_000), deadline, ZERO_ADDRESS);
       await coverage.connect(bandA).signGuarantee(1);
       const g2 = await guarantee(tpaB, bandB, $(100));
       await putIn(g2, funder, $(100));
@@ -648,6 +661,218 @@ describe("TourCoverage", function () {
     });
   });
 
+  // ─── CASH, SECURED AND CONTRACTED COVER ─────────────────────────────────
+  describe("the three tiers of cover", function () {
+    it("lets a signed show that nobody has funded clear the launch, and shows it as contracted", async function () {
+      const b = await newShow("contracted", { funded: false });
+      const id = await guarantee(tpaA, bandA, $(300));
+      await reserve(id, tpaA, b, $(300));
+      await coverage.reconcileCoverage();
+      expect(await coverage.launchCleared()).to.equal(true);
+      expect(await coverage.contractedCoverage()).to.equal($(300));
+      expect(await coverage.securedCoverage()).to.equal(0);
+      expect(await coverage.cashCoverage()).to.equal(0);
+      const g = await coverage.getGuarantee(id);
+      expect([g.coveredCash, g.coveredSecured, g.coveredContracted]).to.deep.equal([0n, 0n, $(300)]);
+    });
+
+    it("moves a show from contracted to secured once its parties fund it", async function () {
+      const b = await newShow("becomes-secured", { funded: false });
+      const id = await guarantee(tpaA, bandA, $(300));
+      await reserve(id, tpaA, b, $(300));
+      await coverage.reconcileCoverage();
+      expect(await coverage.contractedCoverage()).to.equal($(300));
+      await fund(b, $(300));
+      await coverage.reconcileCoverage();
+      expect(await coverage.securedCoverage()).to.equal($(300));
+      expect(await coverage.contractedCoverage()).to.equal(0);
+    });
+
+    it("keeps the three apart, and takes a surplus away from the least real cover first", async function () {
+      const a = await newShow("tier-a");                                           // funded: secured
+      const b = await newShow("tier-b", { funded: false });                        // contracted
+      const id = await guarantee(tpaA, bandA, $(500));
+      await putIn(id, funder, $(100));                                             // cash $100
+      await reserve(id, tpaA, a, $(300));                                          // secured $300
+      await reserve(id, tpaA, b, $(200));                                          // contracted $200: $100 too much
+      await coverage.reconcileCoverage();
+      const g = await coverage.getGuarantee(id);
+      expect([g.coveredCash, g.coveredSecured, g.coveredContracted]).to.deep.equal([$(100), $(300), $(100)]);
+      expect(g.covered).to.equal($(500));
+      expect(await coverage.cashCoverage()).to.equal($(100));
+      expect(await coverage.securedCoverage()).to.equal($(300));
+      expect(await coverage.contractedCoverage()).to.equal($(100));
+      expect(await coverage.eligibleCoverage()).to.equal($(500));
+    });
+
+    it("loses contracted cover when the unfunded show is cancelled, and says so", async function () {
+      const b = await newShow("lost", { funded: false });
+      const id = await guarantee(tpaA, bandA, $(300));
+      await reserve(id, tpaA, b, $(300));
+      await coverage.reconcileCoverage();
+      expect(await coverage.launchCleared()).to.equal(true);
+      await b.escrow.connect(tourOwner).cancel();
+      await expect(coverage.reconcileCoverage()).to.emit(coverage, "ShowCoverageInvalidated").withArgs(id, b.show.target, $(300));
+      expect(await coverage.contractedCoverage()).to.equal(0);
+      expect(await coverage.coverageGap()).to.equal($(300));
+      expect(await coverage.launchCleared()).to.equal(true);                       // nothing automatic: no cancelling, no reducing
+      expect((await coverage.getGuarantee(id)).amount).to.equal($(300));
+    });
+  });
+
+  // ─── THE GUARANTOR ──────────────────────────────────────────────────────
+  describe("a guarantor", function () {
+    async function withGuarantor(amount = $(1000), g = funder) {
+      await coverage.connect(tourOwner).registerGuarantee(tpaA.target, amount, deadline, g.address);
+      return coverage.guaranteeCount();
+    }
+
+    it("is named when the guarantee is registered, and has to sign for the guarantee to count", async function () {
+      const id = await withGuarantor();
+      expect((await coverage.getGuarantee(id)).guarantor).to.equal(funder.address);
+      await coverage.connect(bandA).signGuarantee(id);
+      await coverage.connect(tourOwner).signGuarantee(id);
+      await coverage.reconcileCoverage();
+      expect(await coverage.requiredCoverage()).to.equal(0);                         // not yet: the guarantor has not signed
+      await expect(putIn(id, stranger, $(1))).to.be.revertedWithCustomError(coverage, "NotSigned");
+
+      await expect(coverage.connect(stranger).signGuarantee(id)).to.be.revertedWithCustomError(coverage, "NotAuthorized");
+      await expect(coverage.connect(funder).signGuarantee(id)).to.emit(coverage, "GuarantorSigned").withArgs(id, funder.address);
+      await coverage.reconcileCoverage();
+      expect(await coverage.requiredCoverage()).to.equal($(1000));
+    });
+
+    it("is not required: a guarantee without one counts with two signatures", async function () {
+      const id = await guarantee(tpaA, bandA, $(100));
+      expect((await coverage.getGuarantee(id)).guarantor).to.equal(ZERO_ADDRESS);
+      await coverage.reconcileCoverage();
+      expect(await coverage.requiredCoverage()).to.equal($(100));
+      await expect(coverage.connect(stranger).pullFromGuarantor(id)).to.be.revertedWithCustomError(coverage, "NoGuarantor");
+    });
+
+    it("cannot sign for someone else, and an agent of the guarantor cannot sign for it", async function () {
+      const id = await withGuarantor();
+      await expect(coverage.connect(agent).signGuarantee(id)).to.be.revertedWithCustomError(coverage, "NotAuthorized");
+      expect((await coverage.getGuarantee(id)).signedByGuarantor).to.equal(false);
+    });
+
+    async function signedWithGuarantor(amount = $(1000)) {
+      const id = await withGuarantor(amount);
+      for (const who of [bandA, tourOwner, funder]) await coverage.connect(who).signGuarantee(id);
+      return id;
+    }
+
+    it("is asked for the shortfall up to what it has approved and holds, and the rest is recorded as owed", async function () {
+      const id = await signedWithGuarantor($(1000));
+      await usdc.mint(funder.address, $(1000));
+      await usdc.connect(funder).approve(coverage.target, $(400));
+      await expect(coverage.connect(bandA).pullFromGuarantor(id))
+        .to.emit(coverage, "GuarantorShortfall").withArgs(id, $(400), $(600));
+      let g = await coverage.getGuarantee(id);
+      expect(g.deposited).to.equal($(400));
+      expect(g.covered).to.equal($(400));
+      expect(g.guarantorOwed).to.equal($(600));
+      expect(await usdc.balanceOf(funder.address)).to.equal($(600));
+      expect(await usdc.balanceOf(coverage.target)).to.equal($(400));
+      expect(await coverage.cashCoverage()).to.equal($(400));
+      expect(await coverage.depositedBy(id, funder.address)).to.equal($(400));
+
+      await usdc.connect(funder).approve(coverage.target, $(600));
+      await expect(coverage.connect(tourOwner).pullFromGuarantor(id)).to.emit(coverage, "GuarantorShortfall").withArgs(id, $(600), 0);
+      g = await coverage.getGuarantee(id);
+      expect(g.covered).to.equal($(1000));
+      expect(g.guarantorOwed).to.equal(0);
+      await expect(coverage.connect(funder).pullFromGuarantor(id)).to.be.revertedWithCustomError(coverage, "NoShortfall");
+    });
+
+    it("is limited by what it holds as well as what it approved, and nothing happens when it has nothing", async function () {
+      const id = await signedWithGuarantor($(1000));
+      await usdc.mint(funder.address, $(250));
+      await usdc.connect(funder).approve(coverage.target, $(1000));
+      await expect(coverage.connect(funder).pullFromGuarantor(id)).to.emit(coverage, "GuarantorShortfall").withArgs(id, $(250), $(750));
+
+      await usdc.connect(funder).approve(coverage.target, 0);
+      await expect(coverage.connect(funder).pullFromGuarantor(id)).to.emit(coverage, "GuarantorShortfall").withArgs(id, 0, $(750));
+      expect((await coverage.getGuarantee(id)).guarantorOwed).to.equal($(750));
+      expect((await coverage.getGuarantee(id)).deposited).to.equal($(250));
+    });
+
+    it("is asked only for the part other cover does not already give", async function () {
+      const id = await signedWithGuarantor($(1000));
+      await putIn(id, stranger, $(700));
+      await usdc.mint(funder.address, $(1000));
+      await usdc.connect(funder).approve(coverage.target, $(1000));
+      await coverage.connect(bandA).pullFromGuarantor(id);
+      expect((await coverage.getGuarantee(id)).deposited).to.equal($(1000));
+      expect(await usdc.balanceOf(funder.address)).to.equal($(700));                  // took only $300
+    });
+
+    it("can be asked for only by the tour side, the band or the guarantor, and only once the guarantee is signed", async function () {
+      const id = await withGuarantor();
+      await expect(coverage.connect(bandA).pullFromGuarantor(id)).to.be.revertedWithCustomError(coverage, "NotSigned");
+      for (const who of [bandA, tourOwner, funder]) await coverage.connect(who).signGuarantee(id);
+      await expect(coverage.connect(stranger).pullFromGuarantor(id)).to.be.revertedWithCustomError(coverage, "NotAuthorized");
+      await expect(coverage.connect(promoter).pullFromGuarantor(id)).to.be.revertedWithCustomError(coverage, "NotAuthorized");
+      await shell.connect(tourOwner).setOperator(agent.address, true);
+      await coverage.connect(agent).pullFromGuarantor(id);                             // an operator of the tour may
+    });
+
+    it("works out the cover afresh before it asks, so cover that was never reconciled still counts", async function () {
+      const b = await newShow("stale", { funded: false });
+      const id = await signedWithGuarantor($(1000));
+      await reserve(id, tpaA, b, $(300));                                              // $300 contracted, never reconciled
+      await usdc.mint(funder.address, $(1000));
+      await usdc.connect(funder).approve(coverage.target, $(1000));
+      await coverage.connect(bandA).pullFromGuarantor(id);
+      expect((await coverage.getGuarantee(id)).deposited).to.equal($(700));            // only the $700 that was lacking
+      expect((await coverage.getGuarantee(id)).covered).to.equal($(1000));
+    });
+
+    it("records the shortfall as owed when the token refuses the transfer by reverting", async function () {
+      await buildTour("MockBlockableERC20");
+      const id = await signedWithGuarantor($(500));
+      await usdc.mint(funder.address, $(500));
+      await usdc.connect(funder).approve(coverage.target, $(500));
+      await usdc.setBlocked(coverage.target, true);
+      await expect(coverage.connect(bandA).pullFromGuarantor(id)).to.emit(coverage, "GuarantorShortfall").withArgs(id, 0, $(500));
+      expect((await coverage.getGuarantee(id)).deposited).to.equal(0);
+      expect(await usdc.balanceOf(funder.address)).to.equal($(500));
+    });
+
+    it("records the shortfall as owed when the token reports failure by returning false", async function () {
+      await buildTour("MockFalseTransferFromERC20");
+      const id = await signedWithGuarantor($(500));
+      await usdc.mint(funder.address, $(500));
+      await usdc.connect(funder).approve(coverage.target, $(500));
+      await usdc.setFailTransferFrom(true);
+      await expect(coverage.connect(bandA).pullFromGuarantor(id)).to.emit(coverage, "GuarantorShortfall").withArgs(id, 0, $(500));
+      expect((await coverage.getGuarantee(id)).deposited).to.equal(0);
+      expect((await coverage.getGuarantee(id)).guarantorOwed).to.equal($(500));
+      await usdc.setFailTransferFrom(false);
+      await coverage.connect(bandA).pullFromGuarantor(id);
+      expect((await coverage.getGuarantee(id)).deposited).to.equal($(500));
+    });
+
+    it("clears the owed record once the guarantee is covered some other way", async function () {
+      const id = await signedWithGuarantor($(500));
+      await coverage.connect(bandA).pullFromGuarantor(id);                             // nothing approved: all $500 owed
+      expect((await coverage.getGuarantee(id)).guarantorOwed).to.equal($(500));
+      await putIn(id, stranger, $(500));
+      await coverage.reconcileCoverage();
+      expect((await coverage.getGuarantee(id)).guarantorOwed).to.equal(0);
+    });
+
+    it("lets the guarantor take back what was pulled from it before the launch is cleared, like any deposit", async function () {
+      const id = await signedWithGuarantor($(500));
+      await usdc.mint(funder.address, $(200));
+      await usdc.connect(funder).approve(coverage.target, $(200));
+      await coverage.connect(bandA).pullFromGuarantor(id);
+      await coverage.connect(funder).withdrawCoverage(id, $(200));
+      expect(await usdc.balanceOf(funder.address)).to.equal($(200));
+      expect((await coverage.getGuarantee(id)).deposited).to.equal(0);
+    });
+  });
+
   // ─── A REFERENCE MODEL ──────────────────────────────────────────────────
   describe("against an independent model", function () {
     it("matches a plain re-computation over random tours", async function () {
@@ -666,7 +891,10 @@ describe("TourCoverage", function () {
         for (let i = 0; i < 3; i++) ids.push(await guarantee(tpas[i][0], tpas[i][1], amounts[i]));
 
         const shows = [];
-        for (let s = 0; s < 3; s++) shows.push({ b: await newShow(`rnd-${trial}-${s}`, { fixed: BigInt(100 + rnd(300)) * 1_000_000n }), cover: 0n });
+        for (let s = 0; s < 3; s++) {
+          const funded = rnd(2) === 0;
+          shows.push({ b: await newShow(`rnd-${trial}-${s}`, { fixed: BigInt(100 + rnd(300)) * 1_000_000n, funded }), cover: 0n, funded });
+        }
         for (const s of shows) s.cover = await coverage.showCover(s.b.show.target);
 
         const reservations = [];                                  // [guarantee index, show index, amount] in reservation order
@@ -692,12 +920,24 @@ describe("TourCoverage", function () {
         for (let si = 0; si < 3; si++) if (rnd(2) === 0) { await shows[si].b.escrow.connect(tourOwner).cancel(); dead.add(si); }
 
         // the model: each show's pool, handed to reservations in the order they were made
+        const min = (a, b) => (a < b ? a : b);
         const pool = shows.map((s, i) => (dead.has(i) ? 0n : s.cover));
+        const secPool = shows.map((s, i) => (dead.has(i) || !s.funded ? 0n : s.cover));
         const covered = [0n, 0n, 0n];
+        const tiers = [0n, 0n, 0n];                                                       // cash, secured, contracted totals
         for (let gi = 0; gi < 3; gi++) {
-          let c = deposits[gi];
-          for (const r of reservations.filter((x) => x[0] === gi)) { const take = r[2] < pool[r[1]] ? r[2] : pool[r[1]]; pool[r[1]] -= take; c += take; }
-          covered[gi] = c < amounts[gi] ? c : amounts[gi];
+          let secured = 0n, contracted = 0n;
+          for (const r of reservations.filter((x) => x[0] === gi)) {
+            const take = min(r[2], pool[r[1]]); pool[r[1]] -= take;
+            const sec = min(take, secPool[r[1]]); secPool[r[1]] -= sec;
+            secured += sec; contracted += take - sec;
+          }
+          let need = amounts[gi];
+          const cashC = min(deposits[gi], need); need -= cashC;
+          const secC = min(secured, need); need -= secC;
+          const conC = min(contracted, need);
+          covered[gi] = cashC + secC + conC;
+          tiers[0] += cashC; tiers[1] += secC; tiers[2] += conC;
         }
         const required = amounts.reduce((x, y) => x + y, 0n);
         const eligible = covered.reduce((x, y) => x + y, 0n);
@@ -707,6 +947,9 @@ describe("TourCoverage", function () {
         expect(await coverage.eligibleCoverage(), `trial ${trial} eligible`).to.equal(eligible);
         for (let gi = 0; gi < 3; gi++) expect((await coverage.getGuarantee(ids[gi])).covered, `trial ${trial} g${gi}`).to.equal(covered[gi]);
         expect(await coverage.coverageGap()).to.equal(required - eligible);
+        expect(await coverage.cashCoverage(), `trial ${trial} cash`).to.equal(tiers[0]);
+        expect(await coverage.securedCoverage(), `trial ${trial} secured`).to.equal(tiers[1]);
+        expect(await coverage.contractedCoverage(), `trial ${trial} contracted`).to.equal(tiers[2]);
       }
     });
   });

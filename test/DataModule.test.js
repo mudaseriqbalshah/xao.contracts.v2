@@ -26,12 +26,13 @@ describe("Data module", function () {
   const consent = (grants = [1, 1]) => ({ availableMask: 1, grantedMasks: grants, commitment: ethers.id("consent") });
 
   // A show with a data program funded by bandA and bandB (each capped at CAP), with its data module wired in.
-  async function newShow(name, { sign = true, wire = true, maxDiscount = $(2) } = {}) {
+  async function newShow(name, { sign = true, wire = true, maxDiscount = $(2), payoutRules } = {}) {
     const b = await createShow(sys.factory, promoter, showConfig(promoter, artist, t0, {
       anchors: { termsHash: ethers.id(name) }, funding: [],
       tiers: [tier({ quantity: 100, priceUSDC: $(20) })],
       tickets: { discountsEnabled: true, salesTaxBPS: TAX, taxReceiver: promoter.address },
       sweep: { recipients: [promoter.address, artist.address, bandA.address, bandB.address], bps: [3000, 4000, 2000, 1000], notBefore: showEnd },
+      ...(payoutRules ? { payoutRules } : {}),
     }));
     await b.discounts.connect(promoter).configureDataProgram({
       maxDiscount, categoryCount: 1, allowedTypeMask: 1n, budget: 0, redemptionCap: 0, effectiveFrom: 0, effectiveTo: 0,
@@ -94,8 +95,8 @@ describe("Data module", function () {
     t0 = await time.latest();
     showEnd = t0 + 30 * ONE_DAY + 7_200;
     deadline = t0 + 3 * ONE_DAY;
-    impl = await (await ethers.getContractFactory("DataModule")).deploy();
-    factory = await (await ethers.getContractFactory("DataModuleFactory")).deploy(impl.target);
+    impl = sys.dataImpl;
+    factory = sys.dataFactory;                                      // the one the coordinator trusts
   });
 
   // ─── THE FACTORY AND THE MODULE'S SET-UP ────────────────────────────────
@@ -133,7 +134,7 @@ describe("Data module", function () {
     it("lets only the show side name the module, and only before the show is signed", async function () {
       const b = await newShow("guard", { sign: false });
       await expect(b.discounts.connect(stranger).setDataGuard(b.data.target)).to.be.revertedWithCustomError(b.discounts, "NotShowSide");
-      await expect(b.discounts.connect(promoter).setDataGuard(fan.address)).to.be.revertedWithCustomError(b.discounts, "ZeroAddress");
+      await expect(b.discounts.connect(promoter).setDataGuard(fan.address)).to.be.revertedWithCustomError(b.discounts, "NotAuthorized");
       await b.discounts.connect(promoter).setDataGuard(ZERO_ADDRESS);
       expect(await b.discounts.dataGuard()).to.equal(ZERO_ADDRESS);
       await b.discounts.connect(promoter).setDataGuard(b.data.target);
@@ -283,15 +284,19 @@ describe("Data module", function () {
       expect(await b.discounts.funderDebit(bandA.address)).to.equal($(1));
     });
 
-    it("treats a data module that cannot answer as 'not backed'", async function () {
-      const b = await newShow("broken-guard", { sign: false });
-      const dead = await (await ethers.getContractFactory("MockERC20")).deploy("X", "X", 6);   // has code, has no funderBacked
-      await b.discounts.connect(promoter).setDataGuard(dead.target);
-      await b.show.connect(promoter).signTerms();
-      await b.show.connect(artist).signTerms();
-      const price = (await b.ticket.tiers(GA)).priceUSDC;
-      const [q] = await b.discounts.quote(fan.address, [GA], [price], TAX, FEE, GAS, consent());
-      expect(q.discounts.totalDiscount).to.equal(0);
+    it("takes only a module the official factory made for this show", async function () {
+      const b = await newShow("fake-guard", { sign: false, wire: false });
+      const other = await newShow("other-show", { sign: false });
+      const token = await (await ethers.getContractFactory("MockERC20")).deploy("X", "X", 6);
+      await expect(b.discounts.connect(promoter).setDataGuard(token.target)).to.be.revertedWithCustomError(b.discounts, "NotAuthorized");
+      await expect(b.discounts.connect(promoter).setDataGuard(other.data.target)).to.be.revertedWithCustomError(b.discounts, "NotAuthorized");   // another show's
+
+      const f2 = await (await ethers.getContractFactory("DataModuleFactory")).deploy(sys.dataImpl.target);                                   // not the official factory
+      await f2.connect(promoter).createModule(b.show.target, b.discounts.target, [n1.address, n2.address, n3.address], deadline);
+      await expect(b.discounts.connect(promoter).setDataGuard(await f2.moduleOf(b.show.target))).to.be.revertedWithCustomError(b.discounts, "NotAuthorized");
+
+      const impl = await ethers.getContractFactory("DiscountCoordinator");
+      await expect(impl.deploy(ZERO_ADDRESS)).to.be.revertedWithCustomError(impl, "ZeroAddress");
     });
   });
 
@@ -552,6 +557,179 @@ describe("Data module", function () {
       await cancelShow(b);
       for (const w of wallets) await b.data.compensate(bandA.address, w.address);
       expect(await b.data.reserveOf(bandA.address)).to.equal(CAP - owed);
+    });
+  });
+
+  // ─── TOPPING UP A DATA DISCOUNT ─────────────────────────────────────────
+  describe("a top-up", function () {
+    // Each buyer costs each funder $1. A $1.50 cap is enough for one buyer.
+    const SMALL = $("1.5");
+    let b;
+
+    async function topShow(name, { aMode = Mode.PostShow, cap = SMALL, discounts = true } = {}) {
+      const show = await newShow(name, { sign: false, wire: discounts, payoutRules: [] });
+      for (const f of [bandA, bandB]) await show.discounts.connect(f).authorizeFunding(1, f === bandA ? cap : CAP);
+      await show.show.connect(promoter).signTerms();
+      await show.show.connect(artist).signTerms();
+      if (discounts) {
+        await show.data.connect(bandA).setMode(aMode);
+        if (aMode === Mode.Early) await reserve(show, bandA, cap);
+        await show.data.connect(bandB).setMode(Mode.PostShow);
+      }
+      return show;
+    }
+    async function topUp(show, amount, who = bandA) {
+      await usdc.mint(who.address, amount);
+      await usdc.connect(who).approve(show.data.target, amount);
+      return show.data.connect(who).topUp(amount);
+    }
+    const quoted = async (show, who) => {
+      const price = (await show.ticket.tiers(GA)).priceUSDC;
+      return (await show.discounts.quote(who.address, [GA], [price], TAX, FEE, GAS, consent()))[0].discounts.totalDiscount;
+    };
+
+    it("lets a funder whose cap is used up fund more buyers, while tickets are selling", async function () {
+      b = await topShow("top-more");
+      await buy(b, fan);
+      expect(await quoted(b, fan2)).to.equal($(1));                                     // only bandB now: bandA is out of room
+      await time.increaseTo(deadline + 100);                                             // the reserve deadline does not apply
+      await expect(topUp(b, $(1))).to.emit(b.data, "ToppedUp").withArgs(bandA.address, $(1))
+        .and.to.emit(b.discounts, "DataCapRaised").withArgs(bandA.address, $(1), SMALL + $(1));
+      expect(await quoted(b, fan2)).to.equal($(2));
+      expect(await b.discounts.signedDataCap(bandA.address)).to.equal(SMALL);
+      expect((await b.discounts.getFunderAuth(1, bandA.address)).maxDebit).to.equal(SMALL + $(1));
+      expect(await b.data.reserveOf(bandA.address)).to.equal($(1));
+      expect(await b.data.requiredReserve(bandA.address)).to.equal(SMALL + $(1));
+    });
+
+    it("keeps what is beyond the signed cap away from the funder's payout", async function () {
+      b = await topShow("top-split");
+      await buy(b, fan);
+      await topUp(b, $(1));
+      await buy(b, fan2);                                                                // bandA: $2 charged, $1.50 signed
+      expect((await b.discounts.getFunderAuth(1, bandA.address)).debited).to.equal($(2));
+      expect(await b.discounts.funderDebit(bandA.address)).to.equal(SMALL);
+      expect(await b.discounts.payeeDebit(bandA.address)).to.equal(SMALL);
+      expect(await b.discounts.topUpDebt(bandA.address)).to.equal($("0.5"));
+      expect(await b.discounts.totalDebit()).to.equal($(4));
+      expect(await b.discounts.topUpDebt(bandB.address)).to.equal(0);
+
+      await topUp(b, $(2));
+      await buy(b, fan3);                                                                // now wholly beyond the signed cap
+      expect(await b.discounts.funderDebit(bandA.address)).to.equal(SMALL);
+      expect(await b.discounts.topUpDebt(bandA.address)).to.equal($("1.5"));
+      expect(await b.discounts.signedDataCap(bandA.address)).to.equal(SMALL);           // the first signed cap, not the raised one
+    });
+
+    it("pays the part beyond the cap into the show as it completes, so nobody else is out of pocket", async function () {
+      b = await topShow("top-pay");
+      const plain = await newShow("top-plain", { wire: false, payoutRules: [] });       // the same sales without discounts
+      await buy(b, fan);
+      await topUp(b, $(1));
+      await buy(b, fan2);
+      for (const w of [fan, fan2]) {
+        const price = (await plain.ticket.tiers(GA)).priceUSDC;
+        await usdc.mint(w.address, price);
+        await usdc.connect(w).approve(plain.ticket.target, price);
+        await plain.ticket.connect(w).buyTicket(GA);
+      }
+      await time.increaseTo(showEnd);
+      await expect(b.escrow.connect(stranger).executeFinalSweep()).to.emit(b.data, "TopUpPaid").withArgs(bandA.address, b.escrow.target, $("0.5"));
+      await plain.escrow.connect(stranger).executeFinalSweep();
+
+      expect(await b.escrow.earnedBy(promoter.address, 1)).to.equal(await plain.escrow.earnedBy(promoter.address, 1));
+      expect(await b.escrow.earnedBy(artist.address, 1)).to.equal(await plain.escrow.earnedBy(artist.address, 1));
+      expect(await b.escrow.earnedBy(bandA.address, 1)).to.equal((await plain.escrow.earnedBy(bandA.address, 1)) - SMALL);   // $1.50 from its share, $0.50 came from its top-up
+      expect(await b.escrow.earnedBy(bandB.address, 1)).to.equal((await plain.escrow.earnedBy(bandB.address, 1)) - $(2));
+
+      expect(await b.data.reserveOf(bandA.address)).to.equal($("0.5"));
+      const before = await usdc.balanceOf(bandA.address);
+      await b.data.connect(bandA).withdrawReserve();                                      // what was not needed
+      expect(await usdc.balanceOf(bandA.address)).to.equal(before + $("0.5"));
+      expect(await usdc.balanceOf(b.data.target)).to.equal(0);
+    });
+
+    it("is paid when a dispute ends the show too", async function () {
+      b = await topShow("top-dispute");
+      await buy(b, fan);
+      await topUp(b, $(1));
+      await buy(b, fan2);
+      await b.escrow.connect(promoter).raiseDispute();
+      await b.escrow.connect(promoter).resolveDispute(2);                               // release to party A
+      await expect(b.escrow.connect(artist).resolveDispute(2)).to.emit(b.data, "TopUpPaid").withArgs(bandA.address, b.escrow.target, $("0.5"));
+      expect(await usdc.balanceOf(b.escrow.target)).to.equal(0);
+    });
+
+    it("stays with the funder when the show is cancelled, apart from what buyers are owed", async function () {
+      b = await topShow("top-cancel", { aMode: Mode.Early });
+      await buy(b, fan);
+      await topUp(b, $(1));
+      await buy(b, fan2);
+      await release(b, bandA, [fan, fan2]);
+      await cancelShow(b);
+      expect(await b.data.reserveOf(bandA.address)).to.equal(SMALL + $(1));
+      await b.data.compensate(bandA.address, fan.address);
+      await b.data.compensate(bandA.address, fan2.address);                               // the top-up covers the second buyer
+      const before = await usdc.balanceOf(bandA.address);
+      await b.data.connect(bandA).withdrawReserve();
+      expect(await usdc.balanceOf(bandA.address)).to.equal(before + SMALL + $(1) - $(2));
+    });
+
+    it("is only for a funder that already receives data, on a signed show that is not over", async function () {
+      const early = await newShow("top-unsigned", { sign: false });
+      await early.data.connect(bandA).setMode(Mode.PostShow);
+      await expect(topUp(early, $(1))).to.be.revertedWithCustomError(early.data, "NotAllowedNow");
+
+      b = await topShow("top-rules", { aMode: Mode.Early });
+      await expect(b.data.connect(bandA).topUp(0)).to.be.revertedWithCustomError(b.data, "ZeroAmount");
+      await expect(b.data.connect(stranger).topUp(1)).to.be.revertedWithCustomError(b.data, "NotFunderSigner");
+
+      const unbacked = await topShow("top-unbacked");
+      const fresh = await newShow("top-nomode");
+      await expect(topUp(fresh, $(1))).to.be.revertedWithCustomError(fresh.data, "ReserveMissing");   // has not chosen how to receive data
+      void unbacked;
+
+      await b.discounts.connect(bandA).withdrawFunding(1);
+      await expect(topUp(b, $(1))).to.be.revertedWithCustomError(b.discounts, "NotAuthorized");
+
+      const done = await topShow("top-done");
+      await completeShow(done);
+      await expect(topUp(done, $(1))).to.be.revertedWithCustomError(done.data, "NotAllowedNow");
+    });
+
+    it("cannot be faked: only the module raises a cap, only the escrow asks for the money", async function () {
+      b = await topShow("top-guards");
+      await expect(b.discounts.connect(bandA).raiseDataCap(bandA.address, $(5))).to.be.revertedWithCustomError(b.discounts, "NotAuthorized");
+      await expect(b.discounts.connect(promoter).raiseDataCap(bandA.address, $(5))).to.be.revertedWithCustomError(b.discounts, "NotAuthorized");
+      await expect(b.discounts.connect(stranger).payTopUps()).to.be.revertedWithCustomError(b.discounts, "NotAuthorized");
+      await expect(b.data.connect(bandA).payTopUps(bandA.address)).to.be.revertedWithCustomError(b.data, "NotAllowedNow");
+    });
+
+    it("does not change what a funder owes for a membership discount", async function () {
+      const m = await (await ethers.getContractFactory("FanMembership")).deploy();
+      const mf = await (await ethers.getContractFactory("FanMembershipFactory")).deploy(m.target);
+      const r = await (await mf.connect(promoter).createProgram({
+        issuer: promoter.address, scopeType: 0, scopeRef: artist.address, name: "Fans", symbol: "F", baseURI: "",
+        renewable: true, maxSupply: 0, paymentToken: ZERO_ADDRESS, paymentReceiver: ZERO_ADDRESS, saleStart: 0, saleEnd: 0,
+      })).wait();
+      const membership = await ethers.getContractAt("FanMembership", mf.interface.parseLog(r.logs.find((l) => l.address === mf.target)).args.program);
+      await membership.connect(promoter).createTier("Member", "", 1, 365 * ONE_DAY, 0, 0, 0, false);
+      await membership.connect(promoter).grantMembership(1, fan2.address, ethers.ZeroHash, ethers.ZeroHash);
+
+      const show = await newShow("top-member", { sign: false });
+      await show.discounts.connect(bandA).authorizeFunding(1, SMALL);
+      await show.discounts.connect(promoter).configureMembershipProgram({
+        membership: membership.target, minTierPriority: 0, isPercent: false, amount: $(3), priority: 1, allowedTypeMask: 1n, budget: 0, redemptionCap: 0, effectiveFrom: 0, effectiveTo: 0,
+      });
+      await show.discounts.connect(promoter).proposeFunder(2, bandA.address, 0);
+      await show.discounts.connect(bandA).authorizeFunding(2, $(100));
+      await show.show.connect(promoter).signTerms();
+      await show.show.connect(artist).signTerms();
+      await show.data.connect(bandA).setMode(Mode.PostShow);
+      await topUp(show, $(1));
+      await buy(show, fan2, NONE);                                                       // a $3 membership discount, no data
+      expect(await show.discounts.funderDebit(bandA.address)).to.equal($(3));
+      expect(await show.discounts.topUpDebt(bandA.address)).to.equal(0);
     });
   });
 

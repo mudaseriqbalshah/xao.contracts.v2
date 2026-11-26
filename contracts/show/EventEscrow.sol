@@ -433,6 +433,13 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
         _executeDuePayouts();
     }
 
+    /// @dev Money a data funder topped up with, for discounts beyond what it signed, belongs in the
+    ///      pot. A failure never blocks the show from completing.
+    function _pullTopUps() internal {
+        address ledger = discountLedger;
+        if (ledger != address(0)) try IDiscountLedger(ledger).payTopUps() {} catch {}
+    }
+
     /// @dev Pays every payout rule that is due. A fixed payout that cannot be
     ///      covered yet is skipped, not failed.
     function _executeDuePayouts() internal {
@@ -477,6 +484,7 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
         if (block.timestamp < sweepRule.notBefore) revert SweepNotDue();
         _pullFromParent();
         _allocate();
+        _pullTopUps();
         // Payouts that are due go out first. Otherwise the sweep, which anyone
         // can call, would hand everything to its recipients and skip them.
         _executeDuePayouts();
@@ -629,6 +637,7 @@ contract EventEscrow is IEarningsSource, ReentrancyGuard {
         if (resolution == Resolution.Resume) return;
 
         status = EscrowStatus.Completed;
+        _pullTopUps();
         _payHeldFees();
         _payEarning(resolution == Resolution.ReleaseToPartyA ? partyA : partyB, distributable(), Stream.Other);
         emit EscrowCompleted();

@@ -76,10 +76,12 @@ async function deploySystem(tokenName = "MockERC20") {
   await factory.waitForDeployment();
 
   // Shows with discounts clone this; the factory's owner is the first signer.
-  const coordinatorImpl = await (await ethers.getContractFactory("DiscountCoordinator")).deploy();
+  const dataImpl = await (await ethers.getContractFactory("DataModule")).deploy();
+  const dataFactory = await (await ethers.getContractFactory("DataModuleFactory")).deploy(dataImpl.target);
+  const coordinatorImpl = await (await ethers.getContractFactory("DiscountCoordinator")).deploy(dataFactory.target);
   await factory.setDiscountCoordinatorImplementation(coordinatorImpl.target);
 
-  return { registry, usdc, factory, showImpl, escrowImpl, ticketImpl, validatorImpl, coordinatorImpl };
+  return { registry, usdc, factory, showImpl, escrowImpl, ticketImpl, validatorImpl, coordinatorImpl, dataImpl, dataFactory };
 }
 
 /// Builds a full ShowConfig. `t0` is the reference "now".

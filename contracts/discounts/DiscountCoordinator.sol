@@ -140,6 +140,8 @@ contract DiscountCoordinator is IDiscountCoordinator {
     mapping(address => bytes32) public dataCommitment;                // wallet => its consent commitment
     mapping(address => mapping(address => uint256)) public dataShare; // wallet => data funder => what that funder was charged for the claim
     address public dataGuard;                                         // the show's data module (0 = none: every data funder counts)
+    mapping(address => uint256) public signedDataCap;                 // data funder => the cap it signed, once it has topped up
+    mapping(address => uint256) public topUpDebt;                     // data funder => discounts beyond that cap, paid by its top-up
     mapping(address => uint256) public funderDebit;                   // everything a funder owes, over all programs
     mapping(address => uint256) public authorizedTotal;               // the caps a funder has authorized, over all programs
     mapping(address => address) public payeeOf;                       // funder => who the show pays it through (itself, or a tour settlement escrow)
@@ -158,10 +160,17 @@ contract DiscountCoordinator is IDiscountCoordinator {
     event FunderDebited(uint256 indexed programId, address indexed funder, address indexed wallet, uint256 amount);
     event DataClaimed(address indexed wallet, bytes32 commitment);
     event DataGuardSet(address indexed guard);
+    event DataCapRaised(address indexed funder, uint256 amount, uint256 newCap);
     event MemberBenefitRedeemed(address indexed wallet, uint256 indexed programId);
 
+    /// @notice Only a data module made by this factory can be a show's data module: it is the one
+    ///         that can raise a funder's cap, and it only does so for money it has really taken.
+    address public immutable dataModuleFactory;
+
     /// @dev Locks the implementation; only clones can be initialized.
-    constructor() {
+    constructor(address _dataModuleFactory) {
+        if (_dataModuleFactory == address(0)) revert ZeroAddress();
+        dataModuleFactory = _dataModuleFactory;
         initialized = true;
     }
 
@@ -240,9 +249,29 @@ contract DiscountCoordinator is IDiscountCoordinator {
     function setDataGuard(address guard) external {
         _requireShowSide();
         _requireOpen();
-        if (guard != address(0) && guard.code.length == 0) revert ZeroAddress();
+        if (guard != address(0) && IDataModuleFactory(dataModuleFactory).moduleOf(address(show)) != guard) revert NotAuthorized();
         dataGuard = guard;
         emit DataGuardSet(guard);
+    }
+
+    /// @notice A data funder has put extra money into the data module: its cap goes up by that
+    ///         much, even after sales have started. What it is charged beyond the cap it signed
+    ///         is paid from that money, not taken from what the show pays it.
+    function raiseDataCap(address funder, uint256 amount) external {
+        if (msg.sender != dataGuard) revert NotAuthorized();
+        uint256 id = dataProgramId;                     // the module only does this for a signed, running show
+        if (!_funderIn(id, funder)) revert NotAuthorized();
+        FunderAuth storage a = _auth[id][funder];
+        if (signedDataCap[funder] == 0) signedDataCap[funder] = a.maxDebit;
+        a.maxDebit += amount;
+        emit DataCapRaised(funder, amount, a.maxDebit);
+    }
+
+    /// @notice Called by the show's escrow as it completes, so that top-up money is in the pot
+    ///         before it is shared out.
+    function payTopUps() external {
+        if (msg.sender != show.escrow()) revert NotAuthorized();
+        if (dataGuard != address(0)) IDataGuard(dataGuard).payTopUps(msg.sender);
     }
 
     /// @notice List a funder on a program. This only proposes: nothing is charged
@@ -524,10 +553,19 @@ contract DiscountCoordinator is IDiscountCoordinator {
 
     function _charge(uint256 programId, address funder, address wallet, uint256 amount) internal {
         FunderAuth storage a = _auth[programId][funder];
+        uint256 before = a.debited;
         a.debited         += amount;
-        funderDebit[funder] += amount;
-        payeeDebit[payeeOf[funder]] += amount;
         totalDebit        += amount;
+
+        // what goes past the cap the funder signed is paid by its top-up money, not from its payout
+        uint256 signed_ = programId == dataProgramId ? signedDataCap[funder] : 0;
+        uint256 beyond;
+        if (signed_ != 0 && a.debited > signed_) {
+            beyond = a.debited - (before > signed_ ? before : signed_);
+            topUpDebt[funder] += beyond;
+        }
+        funderDebit[funder] += amount - beyond;
+        payeeDebit[payeeOf[funder]] += amount - beyond;
         emit FunderDebited(programId, funder, wallet, amount);
     }
 

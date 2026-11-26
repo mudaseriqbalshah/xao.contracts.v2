@@ -27,6 +27,11 @@ import "../libraries/XaoRoles.sol";
 ///         left out. A funder can move from POST_SHOW to EARLY, never back, because the
 ///         reserve is already held.
 ///
+///         Top-up. While tickets are selling, a funder can put in extra money to raise how much
+///         it funds. Discounts beyond the cap it signed are paid from that money: it goes to the
+///         show's escrow as the show completes, and the rest comes back. If the show is called
+///         off, it is part of the reserve like any other.
+///
 ///         Release. Three independent nodes (named when the module is made) confirm that
 ///         a report went to a funder; two confirmations of the same report record it.
 ///         The contract does not check the report itself, only that two nodes say it
@@ -85,6 +90,8 @@ contract DataModule is IDataGuard {
     event ReleaseConfirmed(bytes32 indexed reportHash, address indexed node, uint8 count);
     event ReportReleased(bytes32 indexed reportId, address indexed funder, address indexed wallet);
     event Compensated(address indexed funder, address indexed wallet, uint256 amount);
+    event ToppedUp(address indexed funder, uint256 amount);
+    event TopUpPaid(address indexed funder, address indexed escrow, uint256 amount);
 
     constructor() {
         initialized = true;
@@ -154,6 +161,35 @@ contract DataModule is IDataGuard {
         reserveOf[funder] = held - amount;
         token.safeTransfer(funder, amount);
         emit ReserveWithdrawn(funder, amount);
+    }
+
+    /// @notice Put in extra money, paid by the caller, to raise how much the funder funds. Only
+    ///         once the show is signed and until it ends, and only for a funder that already
+    ///         receives data (backed). The reserve deadline does not apply.
+    function topUp(uint256 amount) external {
+        if (amount == 0) revert ZeroAmount();
+        address funder = _funderFor(msg.sender);
+        uint8 s = show.status();
+        if (s != 1 && s != 2) revert NotAllowedNow();
+        if (!funderBacked(funder)) revert ReserveMissing();
+        reserveOf[funder] += amount;
+        coordinator.raiseDataCap(funder, amount);
+        token.safeTransferFrom(msg.sender, address(this), amount);
+        emit ToppedUp(funder, amount);
+    }
+
+    /// @notice The show is completing: send its escrow what top-up money has to pay. Only the
+    ///         coordinator, on the escrow's behalf.
+    function payTopUps(address escrow) external override {
+        if (msg.sender != address(coordinator)) revert NotAllowedNow();
+        address[] memory list = coordinator.getFunders(coordinator.dataProgramId());
+        for (uint256 i = 0; i < list.length; i++) {
+            uint256 due = coordinator.topUpDebt(list[i]);
+            if (due == 0) continue;
+            reserveOf[list[i]] -= due;
+            token.safeTransfer(escrow, due);
+            emit TopUpPaid(list[i], escrow, due);
+        }
     }
 
     // ─── NODES: RECORDING THAT A REPORT WENT OUT ──────────────────────────

@@ -71,7 +71,7 @@ describe("DiscountCoordinator", function () {
     await membership.connect(promoter).createTier("Member", "", 1, 30 * 86_400, 0, 0, 0, false);
     await membership.connect(promoter).grantMembership(1, fan.address, ZERO_BYTES32, ZERO_BYTES32);
 
-    const impl = await (await ethers.getContractFactory("DiscountCoordinator")).deploy();
+    const impl = await (await ethers.getContractFactory("DiscountCoordinator")).deploy(sys.dataFactory.target);
     coordFactory = await (await ethers.getContractFactory("DiscountCoordinatorFactory")).deploy(impl.target);
     await coordFactory.connect(promoter).createCoordinator(bundle.show.target, ticket.address);
     coord = await ethers.getContractAt("DiscountCoordinator", await coordFactory.coordinatorOf(bundle.show.target));

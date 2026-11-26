@@ -10,6 +10,10 @@ interface IDiscountLedger {
     ///         the show pays through it. For a funder paid directly this is its own debt; for a
     ///         tour band it is collected from the tour's settlement escrow, which is the payee.
     function payeeDebit(address payee) external view returns (uint256);
+
+    /// @notice Called by the show's escrow as it completes: bring in any top-up money that pays
+    ///         for discounts beyond what funders signed for.
+    function payTopUps() external;
 }
 
 /// @dev The escrow's payout rules and sweep, as the coordinator reads them to find who pays a funder.

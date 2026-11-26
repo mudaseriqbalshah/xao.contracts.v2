@@ -7,6 +7,13 @@ import "../libraries/DiscountMath.sol";
 ///         able to stand behind the data it is promised (early-access reserve in place)?
 interface IDataGuard {
     function funderBacked(address funder) external view returns (bool);
+    /// @notice Send the show's escrow what funders' top-up money has to pay. Coordinator only.
+    function payTopUps(address escrow) external;
+}
+
+/// @notice The official factory of data modules.
+interface IDataModuleFactory {
+    function moduleOf(address show) external view returns (address);
 }
 
 /// @notice What the data module reads from a show's discount coordinator.
@@ -25,6 +32,10 @@ interface IDataSource {
     function getFunderAuth(uint256 programId, address funder) external view returns (FunderAuthView memory);
     /// @notice What `funder` was charged for the data `wallet` shared in its order.
     function dataShare(address wallet, address funder) external view returns (uint256);
+    /// @notice Raise a data funder's cap by money it has just put into the data module. Module only.
+    function raiseDataCap(address funder, uint256 amount) external;
+    /// @notice Data discounts beyond the cap a funder signed: to be paid from its top-up money.
+    function topUpDebt(address funder) external view returns (uint256);
 }
 
 /// @notice What the ticket contract asks a show's discount coordinator.

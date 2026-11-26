@@ -778,6 +778,56 @@ describe("TourSettlementEscrow", function () {
       expect(await module.shortfallOwed(b.show.target, tpaA.target)).to.equal($(500) - cover);   // not $500 less what it was paid
     });
 
+    it("lets a tour band top up its data discount: the extra reaches the tour package and is not taken from the band twice", async function () {
+      await agree(tpaA, bandA, Model.Percentage, { percentageBps: 2_500 });
+      const factory = sys.dataFactory;
+      let data;
+      const consent = { availableMask: 1, grantedMasks: [1], commitment: ethers.id("c") };
+      const b = await discountShow("tour-topup", async (x) => {
+        await x.discounts.connect(promoter).configureDataProgram({ maxDiscount: $(2), categoryCount: 1, allowedTypeMask: 1n, budget: 0, redemptionCap: 0, effectiveFrom: 0, effectiveTo: 0 });
+        await x.discounts.connect(promoter).proposeFunder(1, bandA.address, 1);
+        await x.discounts.connect(bandA).authorizeFunding(1, $(3));                          // enough for one buyer
+        await factory.connect(promoter).createModule(x.show.target, x.discounts.target, [buyers[8].address, buyers[9].address, buyers[10].address], t0 + 3 * ONE_DAY);
+        data = await ethers.getContractAt("DataModule", await factory.moduleOf(x.show.target));
+        await x.discounts.connect(promoter).setDataGuard(data.target);
+      });
+      expect(await b.discounts.payeeOf(bandA.address)).to.equal(module.target);
+      await apply(b, tpaA);
+      await data.connect(bandA).setMode(1);
+
+      const buyData = async (who) => {
+        const price = (await b.ticket.tiers(0)).priceUSDC;
+        const [q, h] = await b.discounts.quote(who.address, [0], [price], await b.ticket.salesTaxBPS(), 200, $(1), consent);
+        await usdc.mint(who.address, q.checkoutTotal);
+        await usdc.connect(who).approve(b.ticket.target, q.checkoutTotal);
+        await b.ticket.connect(who).buyTickets([0], consent, h, q.checkoutTotal);
+      };
+      await usdc.mint(promoter.address, $(300));
+      await usdc.connect(promoter).approve(b.escrow.target, $(300));
+      await b.escrow.connect(promoter).deposit($(300));
+      await buyData(buyers[0]);
+      await usdc.mint(bandA.address, $(5));
+      await usdc.connect(bandA).approve(data.target, $(5));
+      await data.connect(bandA).topUp($(5));
+      await buyData(buyers[1]);
+      await buyData(buyers[2]);
+      for (const w of buyers.slice(3, 5)) {
+        await usdc.mint(w.address, $(20));
+        await usdc.connect(w).approve(b.ticket.target, $(20));
+        await b.ticket.connect(w).buyTicket(0);
+      }
+      expect(await b.discounts.funderDebit(bandA.address)).to.equal($(3));
+      expect(await b.discounts.topUpDebt(bandA.address)).to.equal($(3));
+
+      await time.increaseTo(showEnd);
+      await expect(b.escrow.connect(stranger).executeFinalSweep()).to.emit(data, "TopUpPaid").withArgs(bandA.address, b.escrow.target, $(3));
+      await module.settleShow(b.show.target);
+      expect(await module.nominal(b.show.target)).to.equal(PACKAGE);                          // as if nobody had had a discount
+      expect(await module.discountDebt(b.show.target, tpaA.target)).to.equal($(3));            // only the signed cap comes off its pay
+      expect(await module.payableNet(b.show.target, tpaA.target)).to.equal(PACKAGE / 4n - $(3));
+      expect(await data.reserveOf(bandA.address)).to.equal($(2));
+    });
+
     it("a band with signed terms can fund a discount, and the show's escrow collects from the tour's module", async function () {
       await agree(tpaA, bandA, Model.Percentage, { percentageBps: 2_500 });
       const b = await discountShow("tour-discount", (x) => fund(x, bandA));

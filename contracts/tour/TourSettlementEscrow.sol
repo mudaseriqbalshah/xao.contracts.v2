@@ -64,6 +64,14 @@ interface IShowEscrowView {
 ///         applied band earned (its gross entitlement), takes the discounts it funded
 ///         off that, and pays it from that show's money. Gross earnings are recorded
 ///         unchanged; only the cash paid out is smaller. What is left is the tour side's.
+///
+///         Minimums. A fixed per-show amount (FixedShow) and a per-show floor (MixedShow)
+///         are promised by the band's counterparty (the tour obligor, e.g. the booking
+///         agent). When a show's money does not reach it, less the band's own discounts,
+///         the difference is that counterparty's to pay, for that show only: another
+///         show's money never fills it. `collectShortfall` takes it from the obligor up
+///         to what it has approved and holds; what is not taken stays owed (`inBreach` says
+///         so). Nothing else happens automatically.
 /// @dev Deployed as a minimal-proxy clone by TourSettlementEscrowFactory.
 contract TourSettlementEscrow is ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -92,6 +100,7 @@ contract TourSettlementEscrow is ReentrancyGuard {
     error ShowNotSettled();
     error NothingToPay();
     error TourWindingDown();
+    error NoShortfall();
 
     enum PayModel { FixedShow, FixedTour, Percentage, MixedShow, MixedTour }
     enum PayTiming { AfterShowSettlement, TourMilestone, EndOfTour }
@@ -148,6 +157,9 @@ contract TourSettlementEscrow is ReentrancyGuard {
     mapping(address => mapping(address => uint256)) public paid;            // show => tpa => paid out
     mapping(address => uint256) public remainderOwed;                       // show => the tour side's share
     mapping(address => uint256) public remainderPaid;
+    mapping(address => mapping(address => uint256)) public shortfallOwed;   // show => tpa => minimum not yet made up
+    mapping(address => uint256) public shortfallOutstanding;                // tpa => over all shows
+    uint256 public totalShortfall;
 
     // ─── EVENTS ───────────────────────────────────────────────────────────
     event ArtistTermsRegistered(address indexed tpa, address indexed artistMiniOrg, PayModel model, bytes32 commitment);
@@ -160,6 +172,9 @@ contract TourSettlementEscrow is ReentrancyGuard {
     event BandPaymentReleased(address indexed band, address indexed show, uint256 amount);
     event RemainderReleased(address indexed show, address indexed to, uint256 amount);
     event ShowShortfall(address indexed show, uint256 amount);
+    event ShortfallRecorded(address indexed tpa, address indexed show, uint256 amount);
+    event ShortfallPaid(address indexed tpa, address indexed show, uint256 amount);
+    event PaymentMissed(address indexed tpa, address indexed show, uint256 stillOwed);
 
     /// @dev Locks the implementation; only clones can be initialized.
     constructor() {
@@ -340,6 +355,35 @@ contract TourSettlementEscrow is ReentrancyGuard {
         }
         remainderOwed[show] += have - owedToBands;
         settled[show] = true;
+        _recordShortfalls(show, ledger);
+    }
+
+    /// @notice Take what a show fell short of a band's minimum from the band's counterparty
+    ///         (the tour obligor), up to what it has approved and holds, and credit it to that
+    ///         band for that show. What cannot be taken stays owed. Anyone may ask: the money
+    ///         only ever goes to the band it is owed to.
+    function collectShortfall(address show, address tpa) external nonReentrant returns (uint256 pulled) {
+        uint256 owed = shortfallOwed[show][tpa];
+        if (owed == 0) revert NoShortfall();
+
+        address payer = _terms[tpa].tourObligor;
+        uint256 allowance = token.allowance(payer, address(this));
+        uint256 balance = token.balanceOf(payer);
+        uint256 avail = allowance < balance ? allowance : balance;
+        pulled = owed < avail ? owed : avail;
+        if (pulled > 0) {
+            try token.transferFrom(payer, address(this), pulled) returns (bool ok) {
+                if (!ok) pulled = 0;
+            } catch {
+                pulled = 0;
+            }
+        }
+        if (pulled > 0) {
+            liquid += pulled;
+            cash[show] += pulled;
+            _payShortfall(show, tpa, pulled);
+        }
+        if (shortfallOwed[show][tpa] > 0) emit PaymentMissed(tpa, show, shortfallOwed[show][tpa]);
     }
 
     /// @notice Pay a band what it is owed for a settled show, from that show's money. If the
@@ -386,6 +430,7 @@ contract TourSettlementEscrow is ReentrancyGuard {
     ///         and all the money it received has been paid out, or the show was cancelled or expired
     ///         and sent nothing. Read by the tour shell when it closes the tour.
     function canClose() external view returns (bool) {
+        if (totalShortfall != 0) return false;                  // a band's minimum is still to be made up
         for (uint256 i = 0; i < _shows.length; i++) {
             address s = _shows[i];
             if (cash[s] != 0) return false;
@@ -395,6 +440,11 @@ contract TourSettlementEscrow is ReentrancyGuard {
             }
         }
         return true;
+    }
+
+    /// @notice Whether a band's counterparty still owes it part of a per-show minimum.
+    function inBreach(address tpa) external view returns (bool) {
+        return shortfallOutstanding[tpa] != 0;
     }
 
     function getArtistTerms(address tpa) external view returns (ArtistTerms memory) {
@@ -443,8 +493,52 @@ contract TourSettlementEscrow is ReentrancyGuard {
         received[show] += credited;
         cash[show]     += credited;
         liquid         += credited;
-        if (settled[show]) remainderOwed[show] += credited;       // after settlement, new money is the tour side's
+        if (settled[show]) remainderOwed[show] += _fillShortfalls(show, credited);   // this show's minimums first, then the tour side
         emit ShowSettlementReceived(show, credited);
+    }
+
+    /// @dev What a band was promised for this show at least, less the discounts it funded, and
+    ///      did not get from it.
+    function _recordShortfalls(address show, address ledger) internal {
+        address[] storage list = _applied[show];
+        for (uint256 i = 0; i < list.length; i++) {
+            address tpa = list[i];
+            if (ITPAView(tpa).status() != 1) continue;
+            ArtistTerms storage t = _terms[tpa];
+            uint256 minimum = t.model == PayModel.FixedShow ? t.fixedAmount
+                            : t.model == PayModel.MixedShow ? t.guaranteedFloor : 0;
+            uint256 debt = ledger == address(0) ? 0 : IDiscountLedger(ledger).funderDebit(t.artistMiniOrg);
+            uint256 due = minimum > debt ? minimum - debt : 0;
+            uint256 got = payableNet[show][tpa];
+            if (due <= got) continue;
+            shortfallOwed[show][tpa] = due - got;
+            shortfallOutstanding[tpa] += due - got;
+            totalShortfall += due - got;
+            emit ShortfallRecorded(tpa, show, due - got);
+        }
+    }
+
+    /// @dev Money (already counted in `cash`) goes to a band's shortfall for this show.
+    function _payShortfall(address show, address tpa, uint256 amount) internal {
+        shortfallOwed[show][tpa] -= amount;
+        shortfallOutstanding[tpa] -= amount;
+        totalShortfall -= amount;
+        payableNet[show][tpa] += amount;
+        emit ShortfallPaid(tpa, show, amount);
+    }
+
+    /// @dev Late money of a settled show makes up its bands' shortfalls, in the order they apply;
+    ///      returns what is left over.
+    function _fillShortfalls(address show, uint256 amount) internal returns (uint256 left) {
+        left = amount;
+        address[] storage list = _applied[show];
+        for (uint256 i = 0; i < list.length && left > 0; i++) {
+            uint256 owed = shortfallOwed[show][list[i]];
+            uint256 part = owed < left ? owed : left;
+            if (part == 0) continue;
+            _payShortfall(show, list[i], part);
+            left -= part;
+        }
     }
 
     function _entitlement(ArtistTerms storage t, uint256 base) internal view returns (uint256) {

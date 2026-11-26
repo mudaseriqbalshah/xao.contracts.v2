@@ -490,6 +490,204 @@ describe("TourSettlementEscrow", function () {
   });
 
   // ─── BANDS THAT FUND DISCOUNTS ──────────────────────────────────────────
+  // ─── PER-SHOW MINIMUMS ──────────────────────────────────────────────────
+  describe("a per-show minimum the show did not reach", function () {
+    let b;
+    async function setUp(bands, name = "min") {
+      b = await newShow(name);
+      await module.connect(tourOwner).registerShow(b.show.target);
+      for (const [tpa, band, model, o] of bands) {
+        await agree(tpa, band, model, o);
+        const id = await link(tpa, b);
+        await module.connect(tourOwner).applyShow(tpa.target, b.show.target, id);
+      }
+    }
+    // the show pays the tour $355.80
+    const settled = async () => { await playShow(b); await module.connect(stranger).settleShow(b.show.target); };
+    async function obligorHas(amount, allow = amount) {
+      await usdc.mint(tourOwner.address, amount);
+      await usdc.connect(tourOwner).approve(module.target, allow);
+    }
+    const owed = (tpa, show = b) => module.shortfallOwed(show.show.target, tpa.target);
+
+    it("records what the band did not get of its fixed amount, for that show", async function () {
+      await setUp([[tpaA, bandA, Model.FixedShow, { fixedAmount: $(500) }]]);
+      await playShow(b);
+      await expect(module.connect(stranger).settleShow(b.show.target))
+        .to.emit(module, "ShortfallRecorded").withArgs(tpaA.target, b.show.target, $(144.2));
+      expect(await owed(tpaA)).to.equal($(144.2));
+      expect(await module.shortfallOutstanding(tpaA.target)).to.equal($(144.2));
+      expect(await module.totalShortfall()).to.equal($(144.2));
+      expect(await module.inBreach(tpaA.target)).to.equal(true);
+      expect(await module.payableNet(b.show.target, tpaA.target)).to.equal(PACKAGE);
+    });
+
+    it("records the part of a mixed floor the show did not reach, and nothing when the share covers it", async function () {
+      await setUp([[tpaA, bandA, Model.MixedShow, { percentageBps: 1_000, guaranteedFloor: $(400) }]], "mixed-short");
+      await settled();
+      expect(await owed(tpaA)).to.equal($(44.2));
+
+      await setUp([[tpaB, bandB, Model.MixedShow, { percentageBps: 5_000, guaranteedFloor: $(100) }]], "mixed-ok");
+      await settled();
+      expect(await owed(tpaB)).to.equal(0);
+      expect(await module.inBreach(tpaB.target)).to.equal(false);
+    });
+
+    it("records nothing for a percentage band, which has no minimum", async function () {
+      await setUp([[tpaA, bandA, Model.Percentage, { percentageBps: 6_000 }], [tpaB, bandB, Model.Percentage, { percentageBps: 6_000 }]], "pct");
+      await settled();
+      expect(await owed(tpaA)).to.equal(0);
+      expect(await owed(tpaB)).to.equal(0);                                           // cut short, but it never had a minimum
+      expect(await module.totalShortfall()).to.equal(0);
+    });
+
+    it("falls on the bands applied last, each for its own minimum", async function () {
+      await setUp([[tpaA, bandA, Model.FixedShow, { fixedAmount: $(300) }], [tpaB, bandB, Model.FixedShow, { fixedAmount: $(200) }]], "two");
+      await settled();
+      expect(await owed(tpaA)).to.equal(0);
+      expect(await owed(tpaB)).to.equal($(144.2));
+    });
+
+    it("is taken from the tour obligor, up to what it approved and holds, and given only to that band", async function () {
+      await setUp([[tpaA, bandA, Model.FixedShow, { fixedAmount: $(500) }]]);
+      await settled();
+      await obligorHas($(1000), $(100));                                               // approves only $100
+      await expect(module.connect(stranger).collectShortfall(b.show.target, tpaA.target))
+        .to.emit(module, "ShortfallPaid").withArgs(tpaA.target, b.show.target, $(100))
+        .and.to.emit(module, "PaymentMissed").withArgs(tpaA.target, b.show.target, $(44.2));
+      expect(await owed(tpaA)).to.equal($(44.2));
+      expect(await module.payableNet(b.show.target, tpaA.target)).to.equal(PACKAGE + $(100));
+      expect(await module.cash(b.show.target)).to.equal(PACKAGE + $(100));
+      expect(await usdc.balanceOf(tourOwner.address)).to.equal($(900));
+
+      await usdc.connect(tourOwner).approve(module.target, $(1000));
+      await expect(module.connect(bandA).collectShortfall(b.show.target, tpaA.target))
+        .to.emit(module, "ShortfallPaid").withArgs(tpaA.target, b.show.target, $(44.2))
+        .and.to.not.emit(module, "PaymentMissed");
+      expect(await module.inBreach(tpaA.target)).to.equal(false);
+      expect(await module.totalShortfall()).to.equal(0);
+      expect(await usdc.balanceOf(tourOwner.address)).to.equal($(855.8));              // only what was owed
+
+      await module.connect(stranger).releaseBandPayout(b.show.target, tpaA.target);
+      expect(await usdc.balanceOf(bandA.address)).to.equal($(500));                    // the whole minimum
+      await expect(module.connect(stranger).collectShortfall(b.show.target, tpaA.target)).to.be.revertedWithCustomError(module, "NoShortfall");
+    });
+
+    it("is limited by the obligor's balance too, and stays owed when there is nothing to take", async function () {
+      await setUp([[tpaA, bandA, Model.FixedShow, { fixedAmount: $(500) }]]);
+      await settled();
+      await expect(module.connect(stranger).collectShortfall(b.show.target, tpaA.target))
+        .to.emit(module, "PaymentMissed").withArgs(tpaA.target, b.show.target, $(144.2));
+      await obligorHas($(40), $(1000));
+      await module.connect(stranger).collectShortfall(b.show.target, tpaA.target);
+      expect(await owed(tpaA)).to.equal($(104.2));
+      expect(await usdc.balanceOf(tourOwner.address)).to.equal(0);
+    });
+
+    it("cannot be collected before the show is settled, or where nothing is owed", async function () {
+      await setUp([[tpaA, bandA, Model.FixedShow, { fixedAmount: $(500) }]]);
+      await expect(module.collectShortfall(b.show.target, tpaA.target)).to.be.revertedWithCustomError(module, "NoShortfall");
+      await settled();
+      await expect(module.collectShortfall(b.show.target, tpaB.target)).to.be.revertedWithCustomError(module, "NoShortfall");
+    });
+
+    it("is never filled with another show's money", async function () {
+      await setUp([[tpaA, bandA, Model.FixedShow, { fixedAmount: $(500) }]], "short-one");
+      const short = b;
+      const rich = await newShow("rich-one");
+      await module.connect(tourOwner).registerShow(rich.show.target);
+      const id = await link(tpaA, rich);
+      await module.connect(tourOwner).applyShow(tpaA.target, rich.show.target, id);
+      b = short;
+      await playShow(short);
+      await usdc.mint(promoter.address, $(900));
+      await usdc.connect(promoter).approve(rich.escrow.target, $(900));
+      await rich.escrow.connect(promoter).deposit($(900));
+      await rich.escrow.connect(stranger).executeFinalSweep();
+      await module.connect(stranger).settleShow(rich.show.target);
+      await module.connect(stranger).settleShow(short.show.target);
+
+      expect(await module.shortfallOwed(short.show.target, tpaA.target)).to.equal($(144.2));
+      expect(await module.shortfallOwed(rich.show.target, tpaA.target)).to.equal(0);
+      const remainder = await module.remainderOwed(rich.show.target);
+      expect(remainder).to.be.gt($(144.2));                                              // plenty left over there
+      await module.connect(stranger).releaseRemainder(rich.show.target);                 // and it goes to the tour side, untouched
+      expect(await module.shortfallOwed(short.show.target, tpaA.target)).to.equal($(144.2));
+    });
+
+    it("keeps the tour open until it is made up", async function () {
+      await setUp([[tpaA, bandA, Model.FixedShow, { fixedAmount: $(500) }]]);
+      await settled();
+      await module.connect(stranger).releaseBandPayout(b.show.target, tpaA.target);
+      expect(await module.canClose()).to.equal(false);
+      await obligorHas($(144.2));
+      await module.connect(stranger).collectShortfall(b.show.target, tpaA.target);
+      await module.connect(stranger).releaseBandPayout(b.show.target, tpaA.target);
+      expect(await module.canClose()).to.equal(true);
+    });
+
+    it("is not asked for from an agreement that was ended before the show was settled", async function () {
+      await setUp([[tpaA, bandA, Model.FixedShow, { fixedAmount: $(500) }]]);
+      await playShow(b);
+      await tpaA.connect(tourOwner).terminate("ipfs://ended");
+      await module.connect(stranger).settleShow(b.show.target);
+      expect(await owed(tpaA)).to.equal(0);
+    });
+
+    it("is made up first by money of the same show that arrives late, and only the rest goes to the tour side", async function () {
+      await buildTour("MockBlockableERC20");
+      t0 = await time.latest();
+      showEnd = t0 + 30 * ONE_DAY + 7_200;
+      await setUp([[tpaA, bandA, Model.FixedShow, { fixedAmount: $(300) }], [tpaB, bandB, Model.FixedShow, { fixedAmount: $(40) }]], "late");
+      await usdc.setBlocked(module.target, true);
+      await playShow(b);
+      await module.connect(stranger).settleShow(b.show.target);                          // nothing arrived
+      expect(await owed(tpaA)).to.equal($(300));
+      expect(await owed(tpaB)).to.equal($(40));
+
+      await usdc.setBlocked(module.target, false);
+      await module.connect(stranger).claimShow(b.show.target);                           // $355.80 arrives late
+      expect(await owed(tpaA)).to.equal(0);
+      expect(await owed(tpaB)).to.equal(0);
+      expect(await module.totalShortfall()).to.equal(0);
+      expect(await module.payableNet(b.show.target, tpaA.target)).to.equal($(300));
+      expect(await module.payableNet(b.show.target, tpaB.target)).to.equal($(40));
+      expect(await module.remainderOwed(b.show.target)).to.equal($(15.8));
+      await module.connect(stranger).releaseBandPayout(b.show.target, tpaA.target);
+      await module.connect(stranger).releaseBandPayout(b.show.target, tpaB.target);
+      await module.connect(stranger).releaseRemainder(b.show.target);
+      expect(await module.cash(b.show.target)).to.equal(0);
+    });
+
+    it("fills late money in the order the bands apply when it is not enough for all", async function () {
+      await buildTour("MockBlockableERC20");
+      t0 = await time.latest();
+      showEnd = t0 + 30 * ONE_DAY + 7_200;
+      await setUp([[tpaA, bandA, Model.FixedShow, { fixedAmount: $(300) }], [tpaB, bandB, Model.FixedShow, { fixedAmount: $(200) }]], "late-short");
+      await usdc.setBlocked(module.target, true);
+      await playShow(b);
+      await module.connect(stranger).settleShow(b.show.target);
+      await usdc.setBlocked(module.target, false);
+      await module.connect(stranger).claimShow(b.show.target);
+      expect(await owed(tpaA)).to.equal(0);
+      expect(await owed(tpaB)).to.equal($(144.2));
+      expect(await module.remainderOwed(b.show.target)).to.equal(0);
+    });
+
+    it("stays owed when the token reports the transfer failed", async function () {
+      await buildTour("MockFalseTransferFromERC20");
+      t0 = await time.latest();
+      showEnd = t0 + 30 * ONE_DAY + 7_200;
+      await setUp([[tpaA, bandA, Model.FixedShow, { fixedAmount: $(500) }]], "false-token");
+      await settled();
+      await obligorHas($(1000));
+      await usdc.setFailTransferFrom(true);
+      await expect(module.collectShortfall(b.show.target, tpaA.target)).to.emit(module, "PaymentMissed");
+      expect(await owed(tpaA)).to.equal($(144.2));
+      expect(await module.cash(b.show.target)).to.equal(PACKAGE);
+    });
+  });
+
   describe("discounts funded by a tour's bands", function () {
     let membership;
     const NO_CONSENT = { availableMask: 0, grantedMasks: [], commitment: ZERO_BYTES32 };
@@ -565,6 +763,19 @@ describe("TourSettlementEscrow", function () {
 
     beforeEach(async function () {
       membership = await members();
+    });
+
+    it("measures a minimum after the band's own discounts: the obligor does not pay them back", async function () {
+      await agree(tpaA, bandA, Model.FixedShow, { fixedAmount: $(500) });
+      const b = await discountShow("tour-min-discount", (x) => fund(x, bandA, $(300)));
+      await apply(b, tpaA);
+      await playDiscounted(b);
+      await module.settleShow(b.show.target);
+      const debt = await b.discounts.funderDebit(bandA.address);
+      expect(debt).to.be.gt(0);
+      const cover = await module.allocated(b.show.target, tpaA.target);
+      expect(await module.payableNet(b.show.target, tpaA.target)).to.equal(cover - debt);
+      expect(await module.shortfallOwed(b.show.target, tpaA.target)).to.equal($(500) - cover);   // not $500 less what it was paid
     });
 
     it("a band with signed terms can fund a discount, and the show's escrow collects from the tour's module", async function () {

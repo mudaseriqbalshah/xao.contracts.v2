@@ -111,7 +111,7 @@ describe("Tour lifecycle", function () {
       artistMiniOrg: band.address, tourObligor: tourOwner.address, model: Model.FixedShow, timing: 0,
       fixedAmount: $(100), percentageBps: 0, guaranteedFloor: 0,
       revenueBaseHash: ethers.id("base"), cancellationTermsHash: ZERO_BYTES32, reserveRulesHash: ZERO_BYTES32, showEligibilityHash: ZERO_BYTES32,
-      coverageDeadline: 0, termsVersionHash: await tpa.termsHash(),
+      coverageDeadline: 0, installmentAmount: 0, scheduleKind: 0, scheduleValue: 0, scheduleStart: 0, termsVersionHash: await tpa.termsHash(),
     };
     await module.connect(tourOwner).registerArtistTPA(tpa.target, terms);
     await module.connect(band).signArtistTerms(tpa.target);
@@ -295,7 +295,7 @@ describe("Tour lifecycle", function () {
       await expect(module.connect(tourOwner).applyShow(tpaA.target, b.show.target, edge)).to.be.revertedWithCustomError(module, "TourWindingDown");
       const terms = {
         artistMiniOrg: bandB.address, tourObligor: tourOwner.address, model: Model.FixedShow, timing: 0, fixedAmount: $(1), percentageBps: 0, guaranteedFloor: 0,
-        revenueBaseHash: ZERO_BYTES32, cancellationTermsHash: ZERO_BYTES32, reserveRulesHash: ZERO_BYTES32, showEligibilityHash: ZERO_BYTES32, coverageDeadline: 0, termsVersionHash: await tpaB.termsHash(),
+        revenueBaseHash: ZERO_BYTES32, cancellationTermsHash: ZERO_BYTES32, reserveRulesHash: ZERO_BYTES32, showEligibilityHash: ZERO_BYTES32, coverageDeadline: 0, installmentAmount: 0, scheduleKind: 0, scheduleValue: 0, scheduleStart: 0, termsVersionHash: await tpaB.termsHash(),
       };
       await expect(module.connect(tourOwner).registerArtistTPA(tpaB.target, terms)).to.be.revertedWithCustomError(module, "TourWindingDown");
     });

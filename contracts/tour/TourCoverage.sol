@@ -435,6 +435,14 @@ contract TourCoverage is ReentrancyGuard {
         return launchCleared || requiredCoverage == 0;
     }
 
+    /// @notice The amount of a TPA's tour-wide guarantee once everyone has signed it, else 0.
+    ///         Read by the settlement escrow before it accepts whole-tour pay terms.
+    function signedGuaranteeAmount(address tpa) external view returns (uint256) {
+        uint256 id = guaranteeOf[tpa];
+        if (id == 0 || !_signed(_g[id])) return 0;
+        return _g[id].amount;
+    }
+
     function getGuarantee(uint256 id) external view returns (Guarantee memory) {
         return _guarantee(id);
     }

@@ -17,6 +17,12 @@ interface ITourShellView {
     function graphRegistry() external view returns (address);
     /// @dev 0 Booking, 1 Touring, 2 Settling, 3 Closed.
     function state() external view returns (uint8);
+    function tourCoverage() external view returns (address);
+}
+
+interface ITourGuaranteeView {
+    /// @notice The amount of a TPA's tour-wide guarantee once everyone has signed it, else 0.
+    function signedGuaranteeAmount(address tpa) external view returns (uint256);
 }
 
 interface ITPAView {
@@ -52,13 +58,20 @@ interface IShowEscrowView {
 ///         difference, so it happens exactly once however often it is called, and it
 ///         is kept per show: the money of one show is never used for another.
 ///
+///         Whole-tour pay (FixedTour). One amount for the whole tour, paid in installments on
+///         a schedule (every so often, or every so many completed shows) or at the end. It
+///         needs a signed tour-wide guarantee of the same amount in the coverage ledger. It is
+///         paid from the tour contract's own money (the tour side's share of settled shows,
+///         which the tour side cannot take while an installment is waiting) and, for what that
+///         does not cover, from the tour obligor. Discounts the band funded come off it.
+///
 ///         Terms. Each band has its own agreement (a TPA). Its pay terms are signed
 ///         here by both the band and the tour obligor, are bound to the TPA's signed
 ///         terms hash, and cannot change; an amendment is a new TPA. Supported pay:
 ///           FixedShow   a fixed amount for each show;
 ///           Percentage  a share of what the show paid the tour package;
-///           MixedShow   the higher of that share and a per-show floor.
-///         Tour-wide pay and launch coverage are not here yet.
+///           MixedShow   the higher of that share and a per-show floor;
+///           FixedTour   one amount for the whole tour (see below).
 ///
 ///         Per show. Once the show's escrow is completed, `settleShow` fixes what each
 ///         applied band earned (its gross entitlement), takes the discounts it funded
@@ -101,9 +114,12 @@ contract TourSettlementEscrow is ReentrancyGuard {
     error NothingToPay();
     error TourWindingDown();
     error NoShortfall();
+    error NoTourGuarantee();
+    error TourAlreadyStarted();
 
     enum PayModel { FixedShow, FixedTour, Percentage, MixedShow, MixedTour }
     enum PayTiming { AfterShowSettlement, TourMilestone, EndOfTour }
+    enum ScheduleKind { None, Period, Shows }
 
     struct ArtistTerms {
         address   artistMiniOrg;        // who is paid: the band's own org wallet
@@ -119,6 +135,10 @@ contract TourSettlementEscrow is ReentrancyGuard {
         bytes32   showEligibilityHash;
         uint64    coverageDeadline;
         bytes32   termsVersionHash;     // must equal the TPA's termsHash
+        uint256   installmentAmount;    // FixedTour paid on a schedule: each payment
+        ScheduleKind scheduleKind;
+        uint64    scheduleValue;        // seconds between payments, or completed shows per payment
+        uint64    scheduleStart;        // Period: when the first payment is due
     }
 
     uint256 public constant MAX_TPAS  = 32;
@@ -160,6 +180,12 @@ contract TourSettlementEscrow is ReentrancyGuard {
     mapping(address => mapping(address => uint256)) public shortfallOwed;   // show => tpa => minimum not yet made up
     mapping(address => uint256) public shortfallOutstanding;                // tpa => over all shows
     uint256 public totalShortfall;
+    address[] internal _tourWide;                                           // TPAs paid one amount for the whole tour
+    mapping(address => address[]) internal _tourShows;                      // such a TPA => the shows applied to it
+    mapping(address => uint256) public tourDebt;                            // discounts it funded, over settled shows
+    mapping(address => uint256) public tourPaid;
+    mapping(address => uint256) public tourMissed;                          // what the last release could not pay
+    uint256 public remainderOutstanding;                                    // the tour side's share not yet taken, all shows
 
     // ─── EVENTS ───────────────────────────────────────────────────────────
     event ArtistTermsRegistered(address indexed tpa, address indexed artistMiniOrg, PayModel model, bytes32 commitment);
@@ -174,7 +200,8 @@ contract TourSettlementEscrow is ReentrancyGuard {
     event ShowShortfall(address indexed show, uint256 amount);
     event ShortfallRecorded(address indexed tpa, address indexed show, uint256 amount);
     event ShortfallPaid(address indexed tpa, address indexed show, uint256 amount);
-    event PaymentMissed(address indexed tpa, address indexed show, uint256 stillOwed);
+    event PaymentMissed(address indexed tpa, address indexed show, uint256 stillOwed);   // show 0 = a tour-wide payment
+    event TourPaymentReleased(address indexed tpa, address indexed band, uint256 fromContract, uint256 fromObligor);
 
     /// @dev Locks the implementation; only clones can be initialized.
     constructor() {
@@ -206,16 +233,23 @@ contract TourSettlementEscrow is ReentrancyGuard {
         ITPAView p = ITPAView(tpa);
         if (p.tourShell() != address(tourShell)) revert TPANotForThisTour();
         if (t.artistMiniOrg != p.partyB() || t.tourObligor != p.partyA() || t.termsVersionHash != p.termsHash()) revert TermsDoNotMatchTPA();
-        if (t.timing != PayTiming.AfterShowSettlement) revert UnsupportedModel();
+        if (t.model == PayModel.FixedTour) {
+            _checkTourTerms(tpa, t);
+        } else if (t.timing != PayTiming.AfterShowSettlement || t.installmentAmount != 0
+            || t.scheduleKind != ScheduleKind.None || t.scheduleValue != 0 || t.scheduleStart != 0) {
+            revert UnsupportedModel();
+        }
 
-        if (t.model == PayModel.FixedShow) {
+        if (t.model == PayModel.FixedTour) {
+            _tourWide.push(tpa);
+        } else if (t.model == PayModel.FixedShow) {
             if (t.fixedAmount == 0) revert InvalidTerms();
         } else if (t.model == PayModel.Percentage) {
             if (t.percentageBps == 0 || t.percentageBps > BPS) revert InvalidTerms();
         } else if (t.model == PayModel.MixedShow) {
             if (t.percentageBps == 0 || t.percentageBps > BPS || t.guaranteedFloor == 0) revert InvalidTerms();
         } else {
-            revert UnsupportedModel();                  // tour-wide pay needs the coverage engine
+            revert UnsupportedModel();                  // a pooled tour-wide floor (MixedTour) is not wanted
         }
 
         _terms[tpa] = t;
@@ -276,6 +310,7 @@ contract TourSettlementEscrow is ReentrancyGuard {
 
         isApplied[show][tpa] = true;
         _applied[show].push(tpa);
+        if (_terms[tpa].model == PayModel.FixedTour) _tourShows[tpa].push(show);
         emit ShowAppliedToTPA(show, tpa);
     }
 
@@ -326,6 +361,7 @@ contract TourSettlementEscrow is ReentrancyGuard {
             left -= cover;
 
             uint256 debt = ledger == address(0) ? 0 : IDiscountLedger(ledger).funderDebit(t.artistMiniOrg);
+            if (t.model == PayModel.FixedTour) tourDebt[tpa] += debt;      // comes off its tour-wide pay
             if (debt > cover) debt = cover;
 
             earnedGross[show][tpa]  = earned;
@@ -354,6 +390,7 @@ contract TourSettlementEscrow is ReentrancyGuard {
             owedToBands = have;
         }
         remainderOwed[show] += have - owedToBands;
+        remainderOutstanding += have - owedToBands;
         settled[show] = true;
         _recordShortfalls(show, ledger);
     }
@@ -366,18 +403,7 @@ contract TourSettlementEscrow is ReentrancyGuard {
         uint256 owed = shortfallOwed[show][tpa];
         if (owed == 0) revert NoShortfall();
 
-        address payer = _terms[tpa].tourObligor;
-        uint256 allowance = token.allowance(payer, address(this));
-        uint256 balance = token.balanceOf(payer);
-        uint256 avail = allowance < balance ? allowance : balance;
-        pulled = owed < avail ? owed : avail;
-        if (pulled > 0) {
-            try token.transferFrom(payer, address(this), pulled) returns (bool ok) {
-                if (!ok) pulled = 0;
-            } catch {
-                pulled = 0;
-            }
-        }
+        pulled = _tryPull(_terms[tpa].tourObligor, address(this), owed);
         if (pulled > 0) {
             liquid += pulled;
             cash[show] += pulled;
@@ -408,20 +434,56 @@ contract TourSettlementEscrow is ReentrancyGuard {
     function releaseRemainder(address show) external nonReentrant returns (uint256 amount) {
         if (!settled[show]) revert ShowNotSettled();
 
-        uint256 reserved;
-        address[] storage list = _applied[show];
-        for (uint256 i = 0; i < list.length; i++) reserved += payableNet[show][list[i]] - paid[show][list[i]];
-
-        uint256 free = cash[show] > reserved ? cash[show] - reserved : 0;
-        uint256 owed = remainderOwed[show] - remainderPaid[show];
-        amount = owed < free ? owed : free;
+        amount = _freeRemainder(show);
+        uint256 waiting;
+        for (uint256 i = 0; i < _tourWide.length; i++) waiting += tourOwedNow(_tourWide[i]);
+        uint256 spare = remainderOutstanding > waiting ? remainderOutstanding - waiting : 0;
+        if (amount > spare) amount = spare;
         if (amount == 0) revert NothingToPay();
 
+        remainderOutstanding -= amount;
         remainderPaid[show] += amount;
         cash[show] -= amount;
         liquid -= amount;
         token.safeTransfer(remainderReceiver, amount);
         emit RemainderReleased(show, remainderReceiver, amount);
+    }
+
+    // ─── WHOLE-TOUR PAY ───────────────────────────────────────────────────
+
+    /// @notice Pay what a whole-tour agreement is owed now: first from the tour contract's own
+    ///         money (the tour side's share of settled shows), then from the tour obligor, up to
+    ///         what it has approved and holds. What neither covers stays owed. Anyone may ask:
+    ///         the money only ever goes to the band.
+    function releaseTourPay(address tpa) external nonReentrant returns (uint256 amount) {
+        uint256 owed = tourOwedNow(tpa);
+        if (owed == 0) revert NothingToPay();
+        ArtistTerms storage t = _terms[tpa];
+        address band = t.artistMiniOrg;
+
+        uint256 left = owed;
+        for (uint256 i = 0; i < _shows.length && left > 0; i++) {
+            address s = _shows[i];
+            if (!settled[s]) continue;
+            uint256 take = _freeRemainder(s);
+            if (take > left) take = left;
+            if (take == 0) continue;
+            remainderOwed[s] -= take;
+            remainderOutstanding -= take;
+            cash[s] -= take;
+            liquid -= take;
+            left -= take;
+        }
+        uint256 fromContract = owed - left;
+        uint256 fromObligor = left == 0 ? 0 : _tryPull(t.tourObligor, band, left);
+        left -= fromObligor;
+
+        amount = fromContract + fromObligor;
+        tourPaid[tpa] += amount;
+        tourMissed[tpa] = left;
+        if (fromContract > 0) token.safeTransfer(band, fromContract);
+        emit TourPaymentReleased(tpa, band, fromContract, fromObligor);
+        if (left > 0) emit PaymentMissed(tpa, address(0), left);
     }
 
     // ─── VIEWS ────────────────────────────────────────────────────────────
@@ -431,6 +493,11 @@ contract TourSettlementEscrow is ReentrancyGuard {
     ///         and sent nothing. Read by the tour shell when it closes the tour.
     function canClose() external view returns (bool) {
         if (totalShortfall != 0) return false;                  // a band's minimum is still to be made up
+        for (uint256 i = 0; i < _tourWide.length; i++) {
+            address t = _tourWide[i];
+            if (!_live(t)) continue;
+            if (tourShell.state() == 0 || tourOwedNow(t) != 0) return false;   // abandoning: end the agreement first
+        }
         for (uint256 i = 0; i < _shows.length; i++) {
             address s = _shows[i];
             if (cash[s] != 0) return false;
@@ -444,7 +511,36 @@ contract TourSettlementEscrow is ReentrancyGuard {
 
     /// @notice Whether a band's counterparty still owes it part of a per-show minimum.
     function inBreach(address tpa) external view returns (bool) {
-        return shortfallOutstanding[tpa] != 0;
+        return shortfallOutstanding[tpa] != 0 || tourMissed[tpa] != 0;
+    }
+
+    /// @notice How many of the shows applied to a whole-tour agreement have completed.
+    function completedShows(address tpa) public view returns (uint256 n) {
+        address[] storage list = _tourShows[tpa];
+        for (uint256 i = 0; i < list.length; i++) {
+            if (IShowEscrowView(IShowInstanceLike(list[i]).escrow()).status() == 2) n++;
+        }
+    }
+
+    /// @notice What has fallen due so far under a whole-tour agreement, before the discounts the
+    ///         band funded and what it has been paid. All of it once the tour is settling.
+    function tourDue(address tpa) public view returns (uint256 due) {
+        ArtistTerms storage t = _terms[tpa];
+        if (t.model != PayModel.FixedTour || !_live(tpa)) return 0;
+        if (tourShell.state() >= 2) return t.fixedAmount;
+        if (t.timing == PayTiming.EndOfTour) return 0;
+        uint256 n;
+        if (t.scheduleKind == ScheduleKind.Shows) n = completedShows(tpa) / t.scheduleValue;
+        else if (block.timestamp >= t.scheduleStart) n = (block.timestamp - t.scheduleStart) / t.scheduleValue + 1;
+        due = n * t.installmentAmount;
+        if (due > t.fixedAmount) due = t.fixedAmount;
+    }
+
+    /// @notice What a whole-tour agreement is owed right now.
+    function tourOwedNow(address tpa) public view returns (uint256) {
+        uint256 due = tourDue(tpa);
+        uint256 gone = tourDebt[tpa] + tourPaid[tpa];
+        return due > gone ? due - gone : 0;
     }
 
     function getArtistTerms(address tpa) external view returns (ArtistTerms memory) {
@@ -469,7 +565,7 @@ contract TourSettlementEscrow is ReentrancyGuard {
         for (uint256 i = 0; i < _tpas.length; i++) {
             ArtistTerms storage t = _terms[_tpas[i]];
             if (t.artistMiniOrg != band || !signedByBand[_tpas[i]] || !signedByObligor[_tpas[i]]) continue;
-            if (t.model == PayModel.FixedShow) fixedAmount += t.fixedAmount;
+            if (t.model == PayModel.FixedShow || t.model == PayModel.FixedTour) fixedAmount += t.fixedAmount;
             else hasSweepShare = true;
         }
     }
@@ -493,7 +589,11 @@ contract TourSettlementEscrow is ReentrancyGuard {
         received[show] += credited;
         cash[show]     += credited;
         liquid         += credited;
-        if (settled[show]) remainderOwed[show] += _fillShortfalls(show, credited);   // this show's minimums first, then the tour side
+        if (settled[show]) {                                       // this show's minimums first, then the tour side
+            uint256 extra = _fillShortfalls(show, credited);
+            remainderOwed[show] += extra;
+            remainderOutstanding += extra;
+        }
         emit ShowSettlementReceived(show, credited);
     }
 
@@ -543,9 +643,63 @@ contract TourSettlementEscrow is ReentrancyGuard {
 
     function _entitlement(ArtistTerms storage t, uint256 base) internal view returns (uint256) {
         if (t.model == PayModel.FixedShow) return t.fixedAmount;
+        if (t.model == PayModel.FixedTour) return 0;                       // paid for the tour, not for a show
         uint256 share = base * t.percentageBps / BPS;
         if (t.model == PayModel.Percentage) return share;
         return share > t.guaranteedFloor ? share : t.guaranteedFloor;      // MixedShow: the higher of the two
+    }
+
+    /// @dev The tour side's share of a settled show that is not set aside for its bands.
+    function _freeRemainder(address show) internal view returns (uint256) {
+        uint256 reserved;
+        address[] storage list = _applied[show];
+        for (uint256 i = 0; i < list.length; i++) reserved += payableNet[show][list[i]] - paid[show][list[i]];
+        uint256 free = cash[show] > reserved ? cash[show] - reserved : 0;
+        uint256 owed = remainderOwed[show] - remainderPaid[show];
+        return owed < free ? owed : free;
+    }
+
+    /// @dev Takes up to `amount` from `payer` to `to`, as far as it has approved and holds it.
+    ///      A transfer the token refuses takes nothing.
+    function _tryPull(address payer, address to, uint256 amount) internal returns (uint256 pulled) {
+        uint256 allowance = token.allowance(payer, address(this));
+        uint256 balance = token.balanceOf(payer);
+        uint256 avail = allowance < balance ? allowance : balance;
+        pulled = amount < avail ? amount : avail;
+        if (pulled > 0) {
+            try token.transferFrom(payer, to, pulled) returns (bool ok) {
+                if (!ok) pulled = 0;
+            } catch {
+                pulled = 0;
+            }
+        }
+    }
+
+    /// @dev Signed by both sides, and the agreement still in force.
+    function _live(address tpa) internal view returns (bool) {
+        return signedByBand[tpa] && signedByObligor[tpa] && ITPAView(tpa).status() == 1;
+    }
+
+    /// @dev A tour-wide amount is agreed before the tour starts, and its schedule has to make sense.
+    function _checkTourTerms(address tpa, ArtistTerms calldata t) internal view {
+        if (tourShell.state() != 0) revert TourAlreadyStarted();
+        if (t.fixedAmount == 0) revert InvalidTerms();
+        if (t.timing == PayTiming.EndOfTour) {
+            if (t.installmentAmount != 0 || t.scheduleKind != ScheduleKind.None || t.scheduleValue != 0 || t.scheduleStart != 0) revert InvalidTerms();
+        } else if (t.timing == PayTiming.TourMilestone) {
+            if (t.installmentAmount == 0 || t.installmentAmount > t.fixedAmount || t.scheduleValue == 0) revert InvalidTerms();
+            if (t.scheduleKind == ScheduleKind.Period) { if (t.scheduleStart == 0) revert InvalidTerms(); }
+            else if (t.scheduleKind != ScheduleKind.Shows || t.scheduleStart != 0) revert InvalidTerms();
+        } else {
+            revert UnsupportedModel();
+        }
+        _checkTourGuarantee(tpa, t.fixedAmount);
+    }
+
+    /// @dev The coverage ledger has to hold a signed guarantee of the same amount.
+    function _checkTourGuarantee(address tpa, uint256 amount) internal view {
+        address c = tourShell.tourCoverage();
+        if (c == address(0) || ITourGuaranteeView(c).signedGuaranteeAmount(tpa) != amount) revert NoTourGuarantee();
     }
 
     function _requireNotWindingDown() internal view {

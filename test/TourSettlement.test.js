@@ -61,7 +61,7 @@ describe("TourSettlementEscrow", function () {
       artistMiniOrg: band.address, tourObligor: tourOwner.address, model, timing: 0,
       fixedAmount: 0, percentageBps: 0, guaranteedFloor: 0,
       revenueBaseHash: ethers.id("base"), cancellationTermsHash: ZERO_BYTES32, reserveRulesHash: ZERO_BYTES32, showEligibilityHash: ZERO_BYTES32,
-      coverageDeadline: 0, termsVersionHash: await tpa.termsHash(), ...o,
+      coverageDeadline: 0, installmentAmount: 0, scheduleKind: 0, scheduleValue: 0, scheduleStart: 0, termsVersionHash: await tpa.termsHash(), ...o,
     };
   }
 

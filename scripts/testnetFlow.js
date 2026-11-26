@@ -268,7 +268,21 @@ async function deploy(name, args = []) {
 async function loadInfra(deployer) {
   if (!LOCAL) {
     const graph = JSON.parse(fs.readFileSync(path.join("deployments", `${hre.network.name}-graph.json`), "utf8"));
-    const bundle = JSON.parse(fs.readFileSync(path.join("deployments", `${hre.network.name}-showbundle.json`), "utf8"));
+    let bundle = JSON.parse(fs.readFileSync(path.join("deployments", `${hre.network.name}-showbundle.json`), "utf8"));
+    // A Phase 2 deployment (scripts/deployPhase2.js) replaces the show bundle and some factories.
+    const phase2File = path.join("deployments", `${hre.network.name}-phase2.json`);
+    if (fs.existsSync(phase2File)) {
+      const p = JSON.parse(fs.readFileSync(phase2File, "utf8"));
+      const c = p.contracts;
+      graph.tourFactory = c.TourFactory;
+      graph.standingAgreementFactory = c.StandingAgreementFactory;
+      bundle = {
+        showFactory: c.ShowFactory, usdcAddress: p.usdcAddress, treasuryAddress: p.treasuryAddress,
+        showInstanceImplementation: c.ShowInstance, eventEscrowImplementation: c.EventEscrow,
+        ticketImplementation: c.XAOTicketV2, entryValidatorImplementation: c.EntryValidator,
+      };
+      console.log(`Using the Phase 2 deployment in ${phase2File}`);
+    }
     return {
       registry: await at("GraphRegistry", graph.graphRegistry),
       tourFactory: await at("TourFactory", graph.tourFactory),

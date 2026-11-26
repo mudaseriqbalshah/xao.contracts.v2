@@ -12,6 +12,8 @@ interface ISettlementModuleShell {
     function tourShell() external view returns (address);
     /// @notice True when every show of the tour is settled and everyone has been paid.
     function canClose() external view returns (bool);
+    /// @notice True when every show of the tour is settled, or was cancelled or expired.
+    function allShowsDone() external view returns (bool);
 }
 
 /// @dev What the shell asks the tour coverage ledger.
@@ -46,6 +48,8 @@ contract TourShell is IGraphParties, IGraphAuthorizer {
     error CoverageNotReady();
     error CannotClose();
     error TourWindingDown();
+    error ShowsNotSettled();
+    error AlreadyMarked();
 
     struct TPAConfig {
         address partyB;          // participant
@@ -84,6 +88,13 @@ contract TourShell is IGraphParties, IGraphAuthorizer {
     enum TourState { Booking, Touring, Settling, Closed }
     TourState public state;
 
+    /// @notice How long a tour with something still unpaid stays open after its last show is settled.
+    uint256 public constant CLOSE_GRACE = 30 days;
+    /// @notice When the last show was settled (as marked while Settling); 0 until then.
+    uint64 public finalSettledAt;
+    /// @notice Set when the tour was closed with something still unpaid: the parties settle it outside.
+    bool public closedUnpaid;
+
     bool public initialized;
 
     event TourShellInitialized(address indexed owner, bytes32 indexed tourId, string tourMetaCID, bytes32 tourMetaHash);
@@ -95,6 +106,8 @@ contract TourShell is IGraphParties, IGraphAuthorizer {
     event TourStarted(address indexed by);
     event SettlementBegun(address indexed by);
     event TourClosed(address indexed by);
+    event FinalSettlement(uint64 at);
+    event TourClosedUnpaid();
     event ShowLinkedPending(address indexed tpa, address indexed eventRoot, bytes32 edgeIdParents, bytes32 edgeIdChildOf);
 
     modifier onlyOwner() {
@@ -263,14 +276,36 @@ contract TourShell is IGraphParties, IGraphAuthorizer {
         if (state != TourState.Touring) revert WrongState();
         state = TourState.Settling;
         emit SettlementBegun(msg.sender);
+        if (ISettlementModuleShell(tourSettlementEscrow).allShowsDone()) _markFinalSettlement();
     }
 
-    /// @notice Close the tour once everything is settled and paid, or abandon it before it starts.
-    ///         Closing lets people who put cover into the coverage ledger take back what is left.
-    function closeTour() external onlyOwner {
-        if (state != TourState.Booking && state != TourState.Settling) revert WrongState();
+    /// @notice Note that the last show has now been settled, which starts the 30 days. Anyone may.
+    function markFinalSettlement() external {
+        if (state != TourState.Settling) revert WrongState();
+        if (finalSettledAt != 0) revert AlreadyMarked();
+        if (!ISettlementModuleShell(tourSettlementEscrow).allShowsDone()) revert ShowsNotSettled();
+        _markFinalSettlement();
+    }
+
+    /// @notice Close the tour. Once it is Settling anyone may: as soon as everything is settled
+    ///         and paid, or 30 days after the last show was settled whatever is still unpaid.
+    ///         The owner may also abandon a tour that never started and owes nothing.
+    ///         Closing lets people who put cover into the coverage ledger take back what is left,
+    ///         and stops the settlement escrow taking anything more from the tour obligor.
+    function closeTour() external {
         address m = tourSettlementEscrow;
-        if (m != address(0) && !ISettlementModuleShell(m).canClose()) revert CannotClose();
+        if (state == TourState.Booking) {
+            if (msg.sender != owner) revert NotOwner();
+            if (m != address(0) && !ISettlementModuleShell(m).canClose()) revert CannotClose();
+        } else if (state == TourState.Settling) {
+            if (!ISettlementModuleShell(m).canClose()) {
+                if (finalSettledAt == 0 || block.timestamp < finalSettledAt + CLOSE_GRACE) revert CannotClose();
+                closedUnpaid = true;
+                emit TourClosedUnpaid();
+            }
+        } else {
+            revert WrongState();
+        }
         state = TourState.Closed;
         emit TourClosed(msg.sender);
     }
@@ -301,6 +336,11 @@ contract TourShell is IGraphParties, IGraphAuthorizer {
     }
 
     // ─── INTERNAL ─────────────────────────────────────────────────────────
+
+    function _markFinalSettlement() internal {
+        finalSettledAt = uint64(block.timestamp);
+        emit FinalSettlement(finalSettledAt);
+    }
 
     function _requireNotWindingDown() internal view {
         if (state == TourState.Settling || state == TourState.Closed) revert TourWindingDown();

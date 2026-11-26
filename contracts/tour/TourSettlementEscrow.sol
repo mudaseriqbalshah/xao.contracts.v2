@@ -492,19 +492,22 @@ contract TourSettlementEscrow is ReentrancyGuard {
     ///         and all the money it received has been paid out, or the show was cancelled or expired
     ///         and sent nothing. Read by the tour shell when it closes the tour.
     function canClose() external view returns (bool) {
-        if (totalShortfall != 0) return false;                  // a band's minimum is still to be made up
+        if (totalShortfall != 0 || !allShowsDone()) return false;   // a minimum still to make up, or a show still open
         for (uint256 i = 0; i < _tourWide.length; i++) {
             address t = _tourWide[i];
             if (!_live(t)) continue;
             if (tourShell.state() == 0 || tourOwedNow(t) != 0) return false;   // abandoning: end the agreement first
         }
+        for (uint256 i = 0; i < _shows.length; i++) if (cash[_shows[i]] != 0) return false;
+        return true;
+    }
+
+    /// @notice Whether every show is settled, or was cancelled or expired.
+    function allShowsDone() public view returns (bool) {
         for (uint256 i = 0; i < _shows.length; i++) {
-            address s = _shows[i];
-            if (cash[s] != 0) return false;
-            if (!settled[s]) {                                  // not settled: only a cancelled or expired show is done
-                uint8 st = IShowInstanceLike(s).status();
-                if (st != 5 && st != 6) return false;
-            }
+            if (settled[_shows[i]]) continue;
+            uint8 st = IShowInstanceLike(_shows[i]).status();
+            if (st != 5 && st != 6) return false;
         }
         return true;
     }
@@ -662,6 +665,7 @@ contract TourSettlementEscrow is ReentrancyGuard {
     /// @dev Takes up to `amount` from `payer` to `to`, as far as it has approved and holds it.
     ///      A transfer the token refuses takes nothing.
     function _tryPull(address payer, address to, uint256 amount) internal returns (uint256 pulled) {
+        if (tourShell.state() == 3) return 0;          // a closed tour takes nothing more: the parties settle outside
         uint256 allowance = token.allowance(payer, address(this));
         uint256 balance = token.balanceOf(payer);
         uint256 avail = allowance < balance ? allowance : balance;

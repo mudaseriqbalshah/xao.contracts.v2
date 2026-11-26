@@ -325,20 +325,21 @@ describe("Tour lifecycle", function () {
 
   // ─── CLOSING ────────────────────────────────────────────────────────────
   describe("closing", function () {
-    it("is done by the owner only, from Settling or from Booking, and not twice", async function () {
+    it("is done by anyone from Settling when nothing is owed, by the owner alone before a tour starts, and not twice", async function () {
       await shell.connect(tourOwner).requestTourStart();
       await expect(shell.connect(tourOwner).closeTour()).to.be.revertedWithCustomError(shell, "WrongState");            // Touring
       await shell.connect(tourOwner).beginSettlement();
-      await shell.connect(tourOwner).setOperator(agent.address, true);
-      await expect(shell.connect(agent).closeTour()).to.be.revertedWithCustomError(shell, "NotOwner");
-      await expect(shell.connect(stranger).closeTour()).to.be.revertedWithCustomError(shell, "NotOwner");
-      await expect(shell.connect(tourOwner).closeTour()).to.emit(shell, "TourClosed").withArgs(tourOwner.address);
+      await expect(shell.connect(stranger).closeTour()).to.emit(shell, "TourClosed").withArgs(stranger.address);
       expect(await shell.state()).to.equal(State.Closed);
+      expect(await shell.closedUnpaid()).to.equal(false);
       await expect(shell.connect(tourOwner).closeTour()).to.be.revertedWithCustomError(shell, "WrongState");
       await expect(shell.connect(tourOwner).beginSettlement()).to.be.revertedWithCustomError(shell, "WrongState");
       await expect(shell.connect(tourOwner).requestTourStart()).to.be.revertedWithCustomError(shell, "WrongState");
 
       await buildTour();
+      await shell.connect(tourOwner).setOperator(agent.address, true);
+      await expect(shell.connect(agent).closeTour()).to.be.revertedWithCustomError(shell, "NotOwner");
+      await expect(shell.connect(stranger).closeTour()).to.be.revertedWithCustomError(shell, "NotOwner");
       await shell.connect(tourOwner).closeTour();                                         // abandoned before it started
       expect(await shell.state()).to.equal(State.Closed);
     });
@@ -396,6 +397,141 @@ describe("Tour lifecycle", function () {
 
     it("gives a tour with no shows the all clear", async function () {
       expect(await module.canClose()).to.equal(true);
+    });
+  });
+
+  // ─── THIRTY DAYS ────────────────────────────────────────────────────────
+  describe("a tour with something still unpaid", function () {
+    const GRACE = 30 * ONE_DAY;
+
+    // a band promised $500 for a show whose package is smaller: the obligor owes the rest
+    async function shortShow(name = "short") {
+      const b = await newShow(name);
+      await module.connect(tourOwner).registerShow(b.show.target);
+      const terms = {
+        artistMiniOrg: bandA.address, tourObligor: tourOwner.address, model: Model.FixedShow, timing: 0, fixedAmount: $(500), percentageBps: 0, guaranteedFloor: 0,
+        revenueBaseHash: ethers.id("base"), cancellationTermsHash: ZERO_BYTES32, reserveRulesHash: ZERO_BYTES32, showEligibilityHash: ZERO_BYTES32,
+        coverageDeadline: 0, installmentAmount: 0, scheduleKind: 0, scheduleValue: 0, scheduleStart: 0, termsVersionHash: await tpaA.termsHash(),
+      };
+      await module.connect(tourOwner).registerArtistTPA(tpaA.target, terms);
+      await module.connect(bandA).signArtistTerms(tpaA.target);
+      await module.connect(tourOwner).signArtistTerms(tpaA.target);
+      const edge = await link(tpaA, b);
+      await module.connect(tourOwner).applyShow(tpaA.target, b.show.target, edge);
+      return b;
+    }
+    async function play(b) {
+      await fund(b, $(300));
+      await time.increaseTo(Math.max(showEnd, (await time.latest()) + 1));
+      await b.escrow.connect(stranger).executeFinalSweep();
+    }
+    async function toSettling() {
+      await shell.connect(tourOwner).requestTourStart();
+      await shell.connect(tourOwner).beginSettlement();
+    }
+
+    it("starts the thirty days only once the last show is settled", async function () {
+      const b = await shortShow();
+      await toSettling();
+      expect(await shell.finalSettledAt()).to.equal(0);                                // the show is still open
+      expect(await module.allShowsDone()).to.equal(false);
+      await expect(shell.markFinalSettlement()).to.be.revertedWithCustomError(shell, "ShowsNotSettled");
+      await play(b);
+      await expect(shell.markFinalSettlement()).to.be.revertedWithCustomError(shell, "ShowsNotSettled");     // completed, not settled
+      await module.settleShow(b.show.target);
+      expect(await module.allShowsDone()).to.equal(true);
+      await expect(shell.connect(stranger).markFinalSettlement()).to.emit(shell, "FinalSettlement");
+      expect(await shell.finalSettledAt()).to.equal(await time.latest());
+      await expect(shell.markFinalSettlement()).to.be.revertedWithCustomError(shell, "AlreadyMarked");
+    });
+
+    it("is marked at once when the shows are already settled as settling begins, and not outside Settling", async function () {
+      const b = await shortShow("early");
+      await play(b);
+      await module.settleShow(b.show.target);
+      await expect(shell.markFinalSettlement()).to.be.revertedWithCustomError(shell, "WrongState");
+      await shell.connect(tourOwner).requestTourStart();
+      await expect(shell.connect(tourOwner).beginSettlement()).to.emit(shell, "FinalSettlement");
+    });
+
+    it("cannot be closed for thirty days, then closes whatever is still owed", async function () {
+      const b = await shortShow("wait");
+      await play(b);
+      await module.settleShow(b.show.target);
+      await toSettling();
+      const at = Number(await shell.finalSettledAt());
+      await expect(shell.connect(stranger).closeTour()).to.be.revertedWithCustomError(shell, "CannotClose");
+      await time.increaseTo(at + GRACE - 2);
+      await expect(shell.connect(tourOwner).closeTour()).to.be.revertedWithCustomError(shell, "CannotClose");
+      await time.setNextBlockTimestamp(at + GRACE);
+      await expect(shell.connect(stranger).closeTour()).to.emit(shell, "TourClosedUnpaid").and.to.emit(shell, "TourClosed");
+      expect(await shell.closedUnpaid()).to.equal(true);
+      expect(await module.shortfallOwed(b.show.target, tpaA.target)).to.equal($(200));   // still on the record
+      expect(await module.inBreach(tpaA.target)).to.equal(true);
+    });
+
+    it("does not start the thirty days by itself: closing waits until somebody has marked the last settlement", async function () {
+      const b = await shortShow("unmarked");
+      await toSettling();
+      await play(b);
+      await module.settleShow(b.show.target);
+      await time.increaseTo((await time.latest()) + 90 * ONE_DAY);
+      await expect(shell.closeTour()).to.be.revertedWithCustomError(shell, "CannotClose");
+      await shell.markFinalSettlement();
+      await expect(shell.closeTour()).to.be.revertedWithCustomError(shell, "CannotClose");
+    });
+
+    it("closes straight away once the shortfall is paid and the money released", async function () {
+      const b = await shortShow("paid-up");
+      await play(b);
+      await module.settleShow(b.show.target);
+      await toSettling();
+      await usdc.mint(tourOwner.address, $(200));
+      await usdc.connect(tourOwner).approve(module.target, $(200));
+      await module.collectShortfall(b.show.target, tpaA.target);
+      await module.releaseBandPayout(b.show.target, tpaA.target);
+      await shell.connect(stranger).closeTour();
+      expect(await shell.closedUnpaid()).to.equal(false);
+    });
+
+    it("takes nothing more from the obligor once closed, but still pays the band what the contract holds", async function () {
+      const b = await shortShow("after");
+      await play(b);
+      await module.settleShow(b.show.target);
+      await toSettling();
+      await time.increaseTo(Number(await shell.finalSettledAt()) + GRACE);
+      await shell.closeTour();
+
+      await usdc.mint(tourOwner.address, $(500));
+      await usdc.connect(tourOwner).approve(module.target, $(500));                     // an approval still lying around
+      await expect(module.collectShortfall(b.show.target, tpaA.target)).to.emit(module, "PaymentMissed");
+      expect(await usdc.balanceOf(tourOwner.address)).to.equal($(500));
+      await module.releaseBandPayout(b.show.target, tpaA.target);                       // the $300 that did arrive
+      expect(await usdc.balanceOf(bandA.address)).to.equal($(300));
+    });
+
+    it("does not ask a guarantor for anything once the tour is closed", async function () {
+      await coverage.connect(tourOwner).registerGuarantee(tpaA.target, $(100), deadline, funder.address);
+      for (const who of [bandA, tourOwner, funder]) await coverage.connect(who).signGuarantee(1);
+      await shell.connect(tourOwner).closeTour();                                      // abandoned
+      await usdc.mint(funder.address, $(100));
+      await usdc.connect(funder).approve(coverage.target, $(100));
+      await expect(coverage.connect(bandA).pullFromGuarantor(1)).to.be.revertedWithCustomError(coverage, "CoverageLocked");
+    });
+
+    it("is closed after thirty days even with a show cancelled along the way", async function () {
+      const b = await shortShow("one-cancelled");
+      const c = await newShow("cancelled-one");
+      await module.connect(tourOwner).registerShow(c.show.target);
+      await c.escrow.connect(tourOwner).cancel();
+      await c.escrow.connect(stranger).continueRefunds(10);
+      await c.escrow.connect(stranger).finalizeCancellationPayout();
+      await play(b);
+      await module.settleShow(b.show.target);
+      await toSettling();
+      expect(await shell.finalSettledAt()).to.not.equal(0);
+      await time.increaseTo(Number(await shell.finalSettledAt()) + GRACE);
+      await shell.closeTour();
     });
   });
 

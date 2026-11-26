@@ -316,6 +316,7 @@ contract TourCoverage is ReentrancyGuard {
         Guarantee storage g = _guarantee(id);
         address guarantor = g.guarantor;
         if (guarantor == address(0)) revert NoGuarantor();
+        if (tourShell.state() == 3) revert CoverageLocked();           // a closed tour takes nothing more
         if (!_signed(g)) revert NotSigned();
         if (!_isTourSide(msg.sender) && !_speaksFor(g.beneficiary, msg.sender) && !_speaksFor(guarantor, msg.sender)) revert NotAuthorized();
 

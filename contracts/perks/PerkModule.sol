@@ -11,6 +11,11 @@ interface IPerkTicket {
     function ownerOf(uint256 tokenId) external view returns (address);
 }
 
+/// @dev What the module asks a show it is scoped to.
+interface IPerkShow {
+    function status() external view returns (uint8);        // 3 InDispute, 5 Cancelled
+}
+
 /// @title PerkModule — who gets which benefit, and what it is worth (Phase 2F)
 /// @notice A module bound to one issuer and one scope (a show, a tour, a venue, an
 ///         artist or a campaign). Each perk is a plain rule: a benefit, who
@@ -20,8 +25,10 @@ interface IPerkTicket {
 ///         contract for rewards).
 ///
 ///         Perks never go stale: whether a wallet qualifies is checked live every
-///         time. A membership that has ended, or a ticket that was refunded,
-///         stops the perk at once, with nothing to revoke.
+///         time. A membership that has ended, a ticket that was refunded, or an NFT
+///         that was moved on stops the perk at once, with nothing to revoke. A module
+///         scoped to a show also stops while that show is cancelled (from the moment
+///         its refunds begin) or in dispute; what was already claimed stays claimed.
 ///
 ///         Ticket price discounts are NOT here. They are funded by the parties
 ///         that offer them and live in the discount program (DiscountMath).
@@ -36,9 +43,13 @@ interface IPerkTicket {
 ///          example a point of sale. A manager can do it too.
 ///        - a wallet claims its own rewards.
 ///
-///      Left out on purpose (spec MVP): attendance-based and NFT-hold eligibility,
-///      combining several conditions in one perk, claims per cycle, per-purchase
-///      use, stacking beyond "best of".
+///      NFT_HOLD asks only whether the wallet holds any token of a collection now, so
+///      a single-use or claim-once perk on it can be taken again by another wallet the
+///      token is moved to; use it for passive perks, or cap the uses.
+///
+///      Left out: attendance-based and reputation eligibility, combining several
+///      conditions in one perk, claims per cycle, per-purchase use, stacking beyond
+///      "best of".
 ///
 ///      Implements IGraphParties (issuer as partyA) so GraphRegistry treats the
 ///      issuer, and an issuer org's operators, as authorized on this node.
@@ -66,13 +77,14 @@ contract PerkModule is IPerkModule, IGraphParties {
 
     enum ScopeType { SHOW, TOUR, VENUE, ARTIST, CAMPAIGN }
     enum PerkType { PRESALE_ACCESS, EVENT_ACCESS, POS_DISCOUNT, CLAIMABLE_REWARD, VOUCHER, BADGE }
-    enum EligibilityType { MEMBERSHIP, TICKET_WINDOW, DIRECT_GRANT }
+    enum EligibilityType { MEMBERSHIP, TICKET_WINDOW, DIRECT_GRANT, NFT_HOLD }
     enum RedemptionMode { PASSIVE_CHECK, SINGLE_USE, PER_EVENT, CLAIM_ONCE }
     enum PerkState { ACTIVE, SUSPENDED, ARCHIVED }
 
     enum EligibilityReason {
         Eligible, UnknownPerk, NotActive, NotStarted, Ended,
-        NotMember, NoQualifyingTicket, NoGrant, AlreadyUsed, CapReached
+        NotMember, NoQualifyingTicket, NoGrant, AlreadyUsed, CapReached,
+        NotHolder, EventOff
     }
 
     struct ModuleInit {
@@ -85,7 +97,7 @@ contract PerkModule is IPerkModule, IGraphParties {
     struct PerkInput {
         PerkType        perkType;
         EligibilityType eligibilityType;
-        address         eligibilityRef;     // MEMBERSHIP: the membership program. TICKET_WINDOW: the ticket contract
+        address         eligibilityRef;     // MEMBERSHIP: the membership program. TICKET_WINDOW: the ticket contract. NFT_HOLD: the collection
         uint32          minTierPriority;    // MEMBERSHIP: lowest tier priority that qualifies, 0 = any member
         uint64          windowFrom;         // TICKET_WINDOW: the ticket must have been bought from here ...
         uint64          windowTo;           // ... to here (0 = no end)
@@ -273,11 +285,14 @@ contract PerkModule is IPerkModule, IGraphParties {
         if (p.state != PerkState.ACTIVE) return EligibilityReason.NotActive;
         if (block.timestamp < p.startTime) return EligibilityReason.NotStarted;
         if (p.endTime != 0 && block.timestamp > p.endTime) return EligibilityReason.Ended;
+        if (_eventOff()) return EligibilityReason.EventOff;
 
         if (p.eligibilityType == EligibilityType.MEMBERSHIP) {
             if (!_isMember(p.eligibilityRef, wallet, p.minTierPriority)) return EligibilityReason.NotMember;
         } else if (p.eligibilityType == EligibilityType.TICKET_WINDOW) {
             if (!_boughtTicketInWindow(p, wallet, ctx.ticketTokenId)) return EligibilityReason.NoQualifyingTicket;
+        } else if (p.eligibilityType == EligibilityType.NFT_HOLD) {
+            if (!_holdsToken(p.eligibilityRef, wallet)) return EligibilityReason.NotHolder;
         } else if (!directGrant[perkId][wallet]) {
             return EligibilityReason.NoGrant;
         }
@@ -433,7 +448,7 @@ contract PerkModule is IPerkModule, IGraphParties {
     function _validate(PerkInput calldata p) internal view {
         if (p.endTime != 0 && p.endTime <= p.startTime) revert InvalidWindow();
 
-        if (p.eligibilityType == EligibilityType.MEMBERSHIP) {
+        if (p.eligibilityType == EligibilityType.MEMBERSHIP || p.eligibilityType == EligibilityType.NFT_HOLD) {
             if (p.eligibilityRef.code.length == 0) revert InvalidEligibility();
         } else if (p.eligibilityType == EligibilityType.TICKET_WINDOW) {
             if (p.eligibilityRef.code.length == 0) revert InvalidEligibility();
@@ -466,6 +481,23 @@ contract PerkModule is IPerkModule, IGraphParties {
     function _isMember(address program, address wallet, uint32 minPriority) internal view returns (bool) {
         (bool ok, bytes memory data) = program.staticcall(abi.encodeCall(IFanMembership.hasActiveTier, (wallet, minPriority)));
         return ok && data.length >= 32 && uint256(bytes32(data)) != 0;
+    }
+
+    /// @dev Whether the wallet holds any token of the collection. A collection that cannot answer
+    ///      counts as not held.
+    function _holdsToken(address collection, address wallet) internal view returns (bool) {
+        (bool ok, bytes memory data) = collection.staticcall(abi.encodeWithSignature("balanceOf(address)", wallet));
+        return ok && data.length >= 32 && uint256(bytes32(data)) != 0;
+    }
+
+    /// @dev For a module scoped to a show: the show is cancelled or in dispute. The show learns it is
+    ///      cancelled the moment refunds begin. A scope that is not a show, or cannot answer, is never "off".
+    function _eventOff() internal view returns (bool) {
+        if (scopeType != ScopeType.SHOW) return false;
+        (bool ok, bytes memory data) = scopeRef.staticcall(abi.encodeCall(IPerkShow.status, ()));
+        if (!ok || data.length < 32) return false;
+        uint256 status = uint256(bytes32(data));
+        return status == 3 || status == 5;
     }
 
     /// @dev The wallet holds `tokenId` and it was bought inside the window. A refunded ticket is

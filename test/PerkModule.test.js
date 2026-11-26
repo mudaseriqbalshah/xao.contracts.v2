@@ -264,12 +264,16 @@ describe("PerkModule", function () {
 
     it("stops when the ticket is refunded", async function () {
       await perks.connect(issuer).createPerk(ticketPerk());
+      const venue = await deployModule(issuer, moduleInit({ scopeType: 2 }));        // not tied to the show: only the ticket matters
+      await venue.connect(issuer).createPerk(perk(ticketPerk()));
       const token = await buyTicket(fan);
       expect(await status(1, fan, ctxFor(token))).to.equal(Reason.Eligible);
+      expect(await venue.eligibility(fan.address, 1, ctxFor(token))).to.equal(Reason.Eligible);
 
       await bundle.escrow.connect(artist).cancel();
       await bundle.escrow.connect(stranger).continueRefunds(5);
-      expect(await status(1, fan, ctxFor(token))).to.equal(Reason.NoQualifyingTicket);
+      expect(await venue.eligibility(fan.address, 1, ctxFor(token))).to.equal(Reason.NoQualifyingTicket);
+      expect(await status(1, fan, ctxFor(token))).to.equal(11);                      // the show module: the show is off
     });
   });
 
@@ -520,6 +524,100 @@ describe("PerkModule", function () {
       await sys.registry.connect(issuer).registerEdge(...args);
       expect(await sys.registry.edgeStatus(id)).to.equal(EdgeStatus.Active);
       await expect(sys.registry.connect(stranger).registerEdge(...args)).to.be.reverted;
+    });
+  });
+
+  // ─── NFT-HOLD ELIGIBILITY ───────────────────────────────────────────────
+  describe("NFT-hold perks", function () {
+    const NFT_HOLD = 3, NotHolder = 10;
+    let nft;
+    beforeEach(async function () {
+      nft = await (await ethers.getContractFactory("MockERC721Holder")).deploy();
+    });
+
+    it("go to whoever holds a token of the collection now, and stop when it is moved on", async function () {
+      const id = await addPerk({ eligibilityType: NFT_HOLD, eligibilityRef: nft.target });
+      expect(await status(id)).to.equal(NotHolder);
+      await nft.mint(fan.address, 1);
+      expect(await status(id)).to.equal(Reason.Eligible);
+      expect(await perks.getPOSDiscount(fan.address, id, 1000, NONE)).to.equal(100);
+      await nft.connect(fan).move(fan2.address, 1);
+      expect(await status(id)).to.equal(NotHolder);
+      expect(await status(id, fan2)).to.equal(Reason.Eligible);
+    });
+
+    it("need a real contract as the collection, and one that cannot answer counts as not held", async function () {
+      await expect(perks.connect(issuer).createPerk(perk({ eligibilityType: NFT_HOLD, eligibilityRef: fan.address })))
+        .to.be.revertedWithCustomError(perks, "InvalidEligibility");
+      const id = await addPerk({ eligibilityType: NFT_HOLD, eligibilityRef: usdc.target });          // has balanceOf
+      expect(await status(id, stranger)).to.equal(NotHolder);
+      const other = await addPerk({ eligibilityType: NFT_HOLD, eligibilityRef: sys.registry.target });   // has no balanceOf
+      expect(await status(other)).to.equal(NotHolder);
+    });
+  });
+
+  // ─── A SHOW THAT IS OFF ─────────────────────────────────────────────────
+  describe("a show that is cancelled or in dispute", function () {
+    const EventOff = 11;
+    let granted;
+    beforeEach(async function () {
+      granted = await addPerk({ eligibilityType: Eligibility.DIRECT_GRANT, eligibilityRef: ZERO_ADDRESS });
+      await perks.connect(issuer).grantPerk(granted, fan.address);
+      expect(await status(granted)).to.equal(Reason.Eligible);
+    });
+
+    it("stops the show's perks as soon as refunds begin, and once it is cancelled", async function () {
+      await bundle.escrow.connect(artist).cancel();
+      expect(await status(granted)).to.equal(EventOff);
+      expect(await perks.isEligible(fan.address, granted, NONE)).to.equal(false);
+      await bundle.escrow.connect(stranger).continueRefunds(10);
+      await bundle.escrow.connect(stranger).finalizeCancellationPayout();
+      expect(await bundle.show.status()).to.equal(5);
+      expect(await status(granted)).to.equal(EventOff);
+    });
+
+    it("stops them while the show is in dispute, and nothing can be redeemed or claimed then", async function () {
+      const single = await addPerk({ eligibilityType: Eligibility.DIRECT_GRANT, eligibilityRef: ZERO_ADDRESS, mode: Mode.SINGLE_USE });
+      const reward = await addPerk({ eligibilityType: Eligibility.DIRECT_GRANT, eligibilityRef: ZERO_ADDRESS, perkType: PerkType.CLAIMABLE_REWARD, mode: Mode.CLAIM_ONCE });
+      await perks.connect(issuer).grantPerk(single, fan.address);
+      await perks.connect(issuer).grantPerk(reward, fan.address);
+      await bundle.escrow.connect(issuer).raiseDispute();
+      expect(await status(granted)).to.equal(EventOff);
+      await expect(perks.connect(issuer).redeemPerk(single, fan.address, NONE)).to.be.revertedWithCustomError(perks, "NotEligible").withArgs(EventOff);
+      await expect(perks.connect(fan).claimReward(reward, fan.address, NONE)).to.be.revertedWithCustomError(perks, "NotEligible").withArgs(EventOff);
+    });
+
+    it("leaves a module that is not scoped to a show alone, whatever its scope refers to", async function () {
+      const venue = await deployModule(issuer, moduleInit({ scopeType: 2 }));                      // VENUE scope, same address
+      await venue.connect(issuer).createPerk(perk({ eligibilityType: Eligibility.DIRECT_GRANT, eligibilityRef: ZERO_ADDRESS }));
+      await venue.connect(issuer).grantPerk(1, fan.address);
+      await bundle.escrow.connect(artist).cancel();
+      expect(await venue.eligibility(fan.address, 1, NONE)).to.equal(Reason.Eligible);
+
+      const plain = await deployModule(issuer, moduleInit({ scopeRef: stranger.address }));         // SHOW scope, not a contract
+      await plain.connect(issuer).createPerk(perk({ eligibilityType: Eligibility.DIRECT_GRANT, eligibilityRef: ZERO_ADDRESS }));
+      await plain.connect(issuer).grantPerk(1, fan.address);
+      expect(await plain.eligibility(fan.address, 1, NONE)).to.equal(Reason.Eligible);
+    });
+  });
+
+  // ─── THE GRAPH EDGE TO A SHOW ───────────────────────────────────────────
+  describe("saying in the graph that a module applies to a show", function () {
+    it("uses an APPLIES_TO edge that the module's issuer registers and every party confirms", async function () {
+      const APPLIES_TO = 3;
+      const other = await createShow(sys.factory, artist, showConfig(artist, fan2, t0, { anchors: { termsHash: ethers.id("other-show") } }));
+      await sys.registry.connect(issuer).registerEdge(perks.target, other.show.target, APPLIES_TO, ZERO_BYTES32, "");
+      const id = ethers.solidityPackedKeccak256(["address", "address", "uint8", "bytes32"], [perks.target, other.show.target, APPLIES_TO, ZERO_BYTES32]);
+      expect(await sys.registry.isEdgeActive(id)).to.equal(false);                      // the show has not agreed
+      await expect(sys.registry.connect(stranger).confirmEdge(id)).to.be.reverted;
+      await sys.registry.connect(artist).confirmEdge(id);
+      expect(await sys.registry.isEdgeActive(id)).to.equal(false);                      // one party is not enough
+      await sys.registry.connect(fan2).confirmEdge(id);
+      expect(await sys.registry.isEdgeActive(id)).to.equal(true);
+    });
+
+    it("cannot be registered by someone who does not speak for the module", async function () {
+      await expect(sys.registry.connect(stranger).registerEdge(perks.target, bundle.show.target, 3, ZERO_BYTES32, "")).to.be.reverted;
     });
   });
 });
